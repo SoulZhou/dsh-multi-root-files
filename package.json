@@ -1,0 +1,54 @@
+{
+  "name": "dsh-multi-root-files",
+  "version": "0.2.0",
+  "description": "Multi-root file explorer for DeepSeek Harness: browse the session root and every additional workspace root, and open a file inline in the right sidebar.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SoulZhou/dsh-multi-root-files.git"
+  },
+  "homepage": "https://github.com/SoulZhou/dsh-multi-root-files#readme",
+  "bugs": {
+    "url": "https://github.com/SoulZhou/dsh-multi-root-files/issues"
+  },
+  "icon": "./icon.svg",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "assets/icon-512.png",
+    "screenshots.json",
+    "README.md",
+    "LICENSE",
+    "screenshots/*.png"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "files",
+    "explorer",
+    "multi-root"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    },
+    "manifestVersion": 1
+  }
+}

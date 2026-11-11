@@ -1,0 +1,9 @@
+# dsh-multi-root-files bundle patch
+#
+# One insert of this plugin's own row. The host half exposes the roots route;
+# the client half registers a sidebar tab through `ctx.betterSidebar`
+# (dsh-better-sidebar), so no profile file edits are needed beyond the bundle
+# registration `plugin_manager install_bundle` performs.
+- insert:
+    - id: multi-root-files
+      name: 'dsh-multi-root-files'

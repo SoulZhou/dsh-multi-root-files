@@ -1,0 +1,52 @@
+node_modules/
+*.tgz
+.DS_Store
+Thumbs.db
+
+# Verification artifacts: never part of the published tree.
+screenshots/*-live.png
+screenshots/contrast.png
+screenshots/diff-colors.png
+screenshots/strip*.png
+strip.png
+tests/probe-*.mjs
+tests/cdp-*.mjs
+icon-render.html
+
+# APK / Android debug artifacts: screenshots, recordings, interface dumps,
+# logcat / bugreport / tombstone / ANR / hprof, debug APKs, temp and backup
+# files. They must never enter the repository.
+.apk-debug/
+apk-debug/
+captures/
+**/screenshots/debug/
+screenshot-*.png
+screenshot-*.jpg
+screenshot-*.jpeg
+Screenshot_*.png
+screen-*.png
+screen-*.jpg
+dump-*.png
+screenrecord*.mp4
+window_dump*.xml
+ui_dump*.xml
+*.uix
+logcat*.txt
+logcat*.log
+bugreport*.txt
+bugreport*.zip
+tombstone_*
+anr_*.txt
+crash-*.txt
+*.hprof
+*.log
+*.apk
+*.aab
+*.ap_
+*.idsig
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*~
