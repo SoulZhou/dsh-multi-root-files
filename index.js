@@ -14,15 +14,24 @@
  * those roots through dsh-better-sidebar's existing /sidebar fs routes, whose
  * containment fence is gone, so an absolute path outside cwd resolves fine.
  *
- * Read-only: this plugin never writes, renames or deletes anything. Opening a
- * file is the sidebar editor's job (still inside the right sidebar).
+ * Read-only over the workspace: this plugin never writes, renames or deletes
+ * anything. Opening a file is the sidebar editor's job (still inside the right
+ * sidebar). The single OS-level action it offers is "open in the file
+ * manager": /open asks the operating system to REVEAL one path in Explorer /
+ * Finder / the desktop's file manager — it launches no editor, accepts no
+ * arguments, and can only point at a real file or folder.
  */
 import { execFile } from 'node:child_process';
-import { readFile, stat } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { extname, join, resolve, relative } from 'node:path';
+import { dirname, extname, join, resolve, relative } from 'node:path';
 
 const API = '/dsh-multi-root-files/api';
+
+/** Panel font scale: allowed range and step (a tenth at a time). */
+const FONT_SCALE_MIN = 0.8;
+const FONT_SCALE_MAX = 1.6;
+const DEFAULT_SETTINGS = { fontScale: 1 };
 
 /** Additional roots one slot may report (matches the multi-root plugin's cap). */
 const MAX_ADDITIONAL_ROOTS = 64;
@@ -34,6 +43,8 @@ const MAX_STATUS_BYTES = 2 * 1024 * 1024;
 const MAX_IGNORE_PATHS = 4096;
 /** Ceiling on an image served into the preview (a bigger one is refused). */
 const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
+/** The file manager gets a shorter leash than git: it should answer at once. */
+const OPEN_TIMEOUT_MS = 6000;
 
 /** Image types the preview can draw, by extension. */
 const IMAGE_TYPES = {
@@ -61,6 +72,45 @@ function dshHome() {
 
 function registryPath() {
   return join(dshHome(), 'storages', 'multi_root_workspace.json');
+}
+
+/**
+ * THIS plugin owns its own settings file. dsh-multi-root-changes stores its
+ * fontScale in multi_root_changes_settings.json; the two panels are meant to
+ * be adjustable independently (the user asked for separate values), so they
+ * must never overwrite each other.
+ */
+function settingsPath() {
+  return join(dshHome(), 'storages', 'multi_root_files_settings.json');
+}
+
+/** Whitelist + clamp + snap to 0.1, mirroring the changes panel's rules. */
+function sanitizeSettings(raw) {
+  let fontScale = DEFAULT_SETTINGS.fontScale;
+  if (raw !== null && typeof raw === 'object') {
+    const value = Number(raw.fontScale);
+    if (Number.isFinite(value)) {
+      const clamped = Math.min(FONT_SCALE_MAX, Math.max(FONT_SCALE_MIN, value));
+      fontScale = Math.round(clamped * 10) / 10;
+    }
+  }
+  return { fontScale };
+}
+
+async function loadSettings() {
+  try {
+    return sanitizeSettings(JSON.parse(await readFile(settingsPath(), 'utf8')));
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+async function saveSettings(settings) {
+  const clean = sanitizeSettings(settings);
+  const file = settingsPath();
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify(clean, null, 2) + '\n', 'utf8');
+  return clean;
 }
 
 /** Platform-aware identity used only for comparing absolute roots. */
@@ -411,6 +461,72 @@ async function handleImage(ctx, request, response) {
 }
 
 /**
+ * POST /open: reveal one path in the OS file manager.
+ *   body: { path: abs }
+ *   reply: { ok: true } — or { ok: false, error }
+ *
+ * A file is SELECTED in its folder (Windows `explorer /select,`, macOS
+ * `open -R`); a folder is opened itself (Windows plain `explorer`, Linux
+ * `xdg-open`). The process runs DETACHED with stdio ignored, so the spawned
+ * window outlives this request and the call answers without waiting for the
+ * GUI to come up. The extension check keeps Windows from treating an
+ * argument-like path as anything but a plain file/folder to reveal.
+ */
+async function handleOpen(ctx, request, response) {
+  const body = await readJsonBody(request);
+  const target = typeof body?.path === 'string' ? body.path : '';
+  if (extname(target) === '.exe' || extname(target) === '.bat' || extname(target) === '.cmd') {
+    sendJson(response, 200, { ok: false, error: 'refusing to open an executable path' });
+    return;
+  }
+  let info;
+  try {
+    info = await stat(target);
+  } catch {
+    // The path is gone (deleted, moved, a stale entry): say THAT, not a
+    // launcher problem — the caller sees a real diagnosis in the toast.
+    sendJson(response, 200, { ok: false, error: 'no such file or folder' });
+    return;
+  }
+  if (!info.isFile() && !info.isDirectory()) {
+    sendJson(response, 200, { ok: false, error: 'not a file or folder' });
+    return;
+  }
+  const absolute = resolve(target);
+  let command;
+  let args;
+  if (process.platform === 'win32') {
+    command = 'explorer.exe';
+    args = info.isDirectory() ? [absolute] : [`/select,${absolute}`];
+  } else if (process.platform === 'darwin') {
+    command = 'open';
+    args = info.isDirectory() ? [absolute] : ['-R', absolute];
+  } else {
+    command = 'xdg-open';
+    args = [absolute];
+  }
+  const child = execFile(command, args, {
+    // NO windowsHide here: it sends SW_HIDE through STARTUPINFO and the file
+    // manager's first window comes up INVISIBLE (a console-app option that
+    // backfires on GUI programs). NO verbatim arguments either: Node's own
+    // quoting keeps `/select,<path with spaces>` one argument.
+    timeout: OPEN_TIMEOUT_MS
+  });
+  child.stdout?.on('data', () => { /* explorer answers nothing useful */ });
+  child.stderr?.on('data', () => { /* ditto; the exit code decides */ });
+  // Detach: the file manager window must not be tied to this request's
+  // lifetime, and "the process spawned" is already success — Explorer in
+  // particular keeps unrelated explorer.exe processes alive forever.
+  child.unref();
+  child.on('error', (error) => {
+    // The response is usually already gone by now; this only keeps a missing
+    // launcher visible in the host log instead of vanishing silently.
+    console.warn('[dsh-multi-root-files] open:', error?.message ?? error);
+  });
+  sendJson(response, 200, { ok: true });
+}
+
+/**
  * POST /diff: the changed LINE NUMBERS of one file.
  *   body: { path: abs }
  *   reply: { added: [n], removed: [n], hunks: [{ from, to, lines }] }
@@ -598,6 +714,48 @@ async function handleRoots(ctx, request, response) {
   }
 }
 
+/**
+ * Read (GET) or write (POST) this panel's durable UI settings.
+ *
+ * Only `fontScale` is accepted (whitelist in sanitizeSettings). The desktop
+ * web port changes on every launch, so browser localStorage is not durable;
+ * the value lives in the plugin's own file under $DSH_HOME/storages and is
+ * deliberately SEPARATE from dsh-multi-root-changes' setting.
+ */
+async function handleSettings(host, request, response) {
+  if (request.method === 'GET') {
+    sendJson(response, 200, await loadSettings());
+    return;
+  }
+  if (request.method === 'POST') {
+    const body = await readJsonBody(request);
+    try {
+      sendJson(response, 200, await saveSettings(body));
+    } catch (error) {
+      sendText(response, 500, error.message || 'settings write failed');
+    }
+    return;
+  }
+  sendText(response, 405, 'method not allowed');
+}
+
+/** GET/POST route with the same error policy as registerPost. */
+function registerSettings(host) {
+  return host.webServer.register({
+    kind: 'exact',
+    path: `${API}/settings`,
+    handler: (request, response) => {
+      Promise.resolve()
+        .then(() => handleSettings(host, request, response))
+        .catch((error) => {
+          const status = Number.isInteger(error?.status) ? error.status : 500;
+          if (!response.headersSent) sendText(response, status, 'internal error');
+          else response.end();
+        });
+    }
+  });
+}
+
 /** One POST route with the same error policy for every handler. */
 function registerPost(host, path, handle) {
   return host.webServer.register({
@@ -623,7 +781,9 @@ export function apply(ctx) {
         registerPost(host, 'roots', handleRoots),
         registerPost(host, 'status', handleStatus),
         registerPost(host, 'image', handleImage),
-        registerPost(host, 'diff', handleDiff)
+        registerPost(host, 'diff', handleDiff),
+        registerPost(host, 'open', handleOpen),
+        registerSettings(host)
       ];
       return () => {
         for (const dispose of disposers) {
@@ -634,4 +794,7 @@ export function apply(ctx) {
   });
 }
 
-export const __test = { pathIdentity, baseName, readAdditionalRoots, statusOfXY, splitNul, parseUnifiedHunks, imageTypeFor };
+export const __test = {
+  pathIdentity, baseName, readAdditionalRoots, statusOfXY, splitNul, parseUnifiedHunks, imageTypeFor,
+  sanitizeSettings, handleSettings, settingsPath, FONT_SCALE_MIN, FONT_SCALE_MAX, DEFAULT_SETTINGS
+};

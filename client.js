@@ -12,7 +12,8 @@
  * fine). Clicking a file reads it through `fs.read` and renders it in a preview
  * pane BESIDE the tree, inside this tab — the same in-tab split the
  * multi-root-changes tab uses, so no new window, no extra sidebar tab, and no
- * external app is involved.
+ * external app is involved. Right-clicking a row (or the preview title) offers
+ * "copy path" and "open in the OS file manager" (the host's /open route).
  *
  * Dependency-free by design: React comes from the shell, no bundler, no imports.
  */
@@ -28,6 +29,7 @@ window.__ModuleLoader__.load({
       Fragment,
       useCallback,
       useEffect,
+      useLayoutEffect,
       useRef,
       useState
     } = React;
@@ -47,6 +49,11 @@ window.__ModuleLoader__.load({
      * Two hundred paths of the longest real names stay well inside the cap.
      */
     const MAX_DECORATION_PATHS = 200;
+    /** Font-size setting: must match the host's FONT_SCALE_* constants. */
+    const FONT_MIN = 0.8;
+    const FONT_MAX = 1.6;
+    const FONT_STEP = 0.1;
+    const FONT_DEFAULT = 1;
 
     const COPY = {
       zh: {
@@ -71,7 +78,22 @@ window.__ModuleLoader__.load({
         previewTruncated: '只显示前 {count} 行',
         ignored: '已忽略',
         close: '关闭',
-        rootCount: '{count} 个目录'
+        copyPath: '复制路径',
+        openInFiles: '在文件管理器打开',
+        copiedPath: '已复制路径',
+        copyFailed: '复制失败',
+        openFailed: '无法在文件管理器打开',
+        openedInFiles: '已在文件管理器打开',
+        rootCount: '{count} 个目录',
+        fontSize: '字体大小',
+        fontSmaller: '缩小字体',
+        fontLarger: '放大字体',
+        fontReset: '恢复默认字体大小',
+        fontScaleTitle: '当前 {percent}% · A− 缩小 / A+ 放大 / 双击数值恢复默认',
+        markdownPreview: '预览',
+        markdownSource: '源码',
+        markdownPreviewTitle: '按 Markdown 排版渲染全文',
+        markdownSourceTitle: '查看逐行源码'
       },
       en: {
         tab: 'Multi-root files',
@@ -95,7 +117,22 @@ window.__ModuleLoader__.load({
         previewTruncated: 'Showing the first {count} lines',
         ignored: 'Ignored',
         close: 'Close',
-        rootCount: '{count} folders'
+        copyPath: 'Copy path',
+        openInFiles: 'Open in File Manager',
+        copiedPath: 'Path copied',
+        copyFailed: 'Could not copy the path',
+        openFailed: 'Could not open in the file manager',
+        openedInFiles: 'Opened in the file manager',
+        rootCount: '{count} folders',
+        fontSize: 'Font size',
+        fontSmaller: 'Smaller font',
+        fontLarger: 'Larger font',
+        fontReset: 'Reset font size',
+        fontScaleTitle: 'Now {percent}% · A− to shrink / A+ to grow / double-click the number to reset',
+        markdownPreview: 'Preview',
+        markdownSource: 'Source',
+        markdownPreviewTitle: 'Render the whole file as formatted Markdown',
+        markdownSourceTitle: 'Show the line-by-line source'
       }
     };
 
@@ -136,14 +173,15 @@ window.__ModuleLoader__.load({
       return clean;
     }
 
-    /** POST one JSON body and return the parsed plain-JSON answer. */
-    async function postPlain(ctx, path, body) {
+    /** Fetch one of this plugin's own routes: GET when body is omitted. */
+    async function fetchJson(ctx, path, body) {
+      const isGet = body === undefined;
       let response;
       try {
         response = await fetch(routeUrl(ctx, path), {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body ?? {})
+          method: isGet ? 'GET' : 'POST',
+          headers: isGet ? undefined : { 'content-type': 'application/json' },
+          body: isGet ? undefined : JSON.stringify(body)
         });
       } catch (error) {
         throw new Error(error instanceof Error ? error.message : String(error));
@@ -154,6 +192,11 @@ window.__ModuleLoader__.load({
         throw new Error(detail);
       }
       return response.json();
+    }
+
+    /** POST one JSON body and return the parsed plain-JSON answer. */
+    function postPlain(ctx, path, body) {
+      return fetchJson(ctx, path, body ?? {});
     }
 
     /** The primary root plus every additional root registered for the session. */
@@ -372,6 +415,11 @@ window.__ModuleLoader__.load({
       return at === -1 ? trimmed : trimmed.slice(at + 1);
     }
 
+    /** Windows-style backslash spelling for the clipboard. */
+    function displayPath(path) {
+      return String(path).replace(/\//g, '\\');
+    }
+
     /* ---------------------------------------------------------------- icons */
 
     function FolderGlyph(props) {
@@ -423,7 +471,7 @@ window.__ModuleLoader__.load({
     /* -------------------------------------------------------------- rows */
 
     function FileRow(props) {
-      const { entry, depth, active, onOpenFile, decoration, icon, t } = props;
+      const { entry, depth, active, onOpenFile, onContextMenu, decoration, icon, t } = props;
       const key = pathKey(entry.path);
       const status = decoration.statuses[key];
       const ignored = decoration.ignored.has(key);
@@ -441,7 +489,8 @@ window.__ModuleLoader__.load({
         style: { paddingLeft: `${6 + depth * INDENT + 16}px` },
         title,
         'aria-current': active === true ? 'true' : undefined,
-        onClick: () => onOpenFile(entry)
+        onClick: () => onOpenFile(entry),
+        onContextMenu: (event) => onContextMenu?.(event, entry.path, false)
       },
       // The host's own file-type artwork (48 colored categories) is the same
       // glyph the built-in Files tab shows; fall back to our sheet when the
@@ -458,7 +507,7 @@ window.__ModuleLoader__.load({
     }
 
     function DirRow(props) {
-      const { entry, depth, open, onToggleDir, decoration } = props;
+      const { entry, depth, open, onToggleDir, onContextMenu, decoration } = props;
       const key = pathKey(entry.path);
       const ignored = decoration.ignored.has(key);
       const changed = decoration.changedDirs.has(key);
@@ -471,7 +520,8 @@ window.__ModuleLoader__.load({
         className: classes.join(' '),
         style: { paddingLeft: `${6 + depth * INDENT}px` },
         title: entry.path,
-        onClick: () => onToggleDir(entry)
+        onClick: () => onToggleDir(entry),
+        onContextMenu: (event) => onContextMenu?.(event, entry.path, true)
       },
       h(CaretGlyph, { open }),
       h(FolderGlyph),
@@ -484,7 +534,7 @@ window.__ModuleLoader__.load({
      * directory hides the subtree without dropping its cached levels.
      */
     function DirectoryLevel(props) {
-      const { path, depth, levels, expanded, activePath, onToggleDir, onOpenFile, t, decoration, fileIcon } = props;
+      const { path, depth, levels, expanded, activePath, onToggleDir, onOpenFile, onContextMenu, t, decoration, fileIcon } = props;
       const level = levels[path];
       if (level === undefined) {
         return h('div', { className: 'mrf-note', style: { paddingLeft: `${6 + depth * INDENT + 16}px` } }, t('loading'));
@@ -508,7 +558,7 @@ window.__ModuleLoader__.load({
         if (entry.isDir === true && entry.name === '.git') continue;
         const open = entry.isDir === true && expanded[entry.path] === true;
         if (entry.isDir === true) {
-          rows.push(h(DirRow, { key: `d:${entry.path}`, entry, depth, open, onToggleDir, decoration }));
+          rows.push(h(DirRow, { key: `d:${entry.path}`, entry, depth, open, onToggleDir, onContextMenu, decoration }));
           if (open) {
             rows.push(h(DirectoryLevel, {
               key: `l:${entry.path}`,
@@ -519,6 +569,7 @@ window.__ModuleLoader__.load({
               activePath,
               onToggleDir,
               onOpenFile,
+              onContextMenu,
               t,
               decoration,
               fileIcon
@@ -531,6 +582,7 @@ window.__ModuleLoader__.load({
             depth,
             active: activePath === entry.path,
             onOpenFile,
+            onContextMenu,
             decoration,
             icon: fileIcon ? fileIcon(entry.path) : undefined,
             t
@@ -548,7 +600,7 @@ window.__ModuleLoader__.load({
     }
 
     function RootSection(props) {
-      const { root, expanded, levels, activePath, onToggleRoot, onToggleDir, onOpenFile, t, decoration, fileIcon } = props;
+      const { root, expanded, levels, activePath, onToggleRoot, onToggleDir, onOpenFile, onContextMenu, t, decoration, fileIcon } = props;
       const open = expanded[root.path] === true;
       const label = root.label || baseName(root.path);
       return h('section', { className: 'mrf-root' },
@@ -556,7 +608,8 @@ window.__ModuleLoader__.load({
           type: 'button',
           className: 'mrf-rootHead',
           title: root.path,
-          onClick: () => onToggleRoot(root)
+          onClick: () => onToggleRoot(root),
+          onContextMenu: (event) => onContextMenu?.(event, root.path, true)
         },
         h(CaretGlyph, { open }),
         h(FolderGlyph, { size: 14 }),
@@ -574,6 +627,7 @@ window.__ModuleLoader__.load({
                   activePath,
                   onToggleDir,
                   onOpenFile,
+                  onContextMenu,
                   t,
                   decoration,
                   fileIcon
@@ -581,13 +635,186 @@ window.__ModuleLoader__.load({
           : null);
     }
 
+    /* ------------------------------------------------------------------ *
+     * A tiny, dependency-free Markdown renderer.
+     *
+     * The client half cannot import a markdown package (no bundler, React is
+     * borrowed from the shell), and rendering untrusted file content through
+     * innerHTML would be an injection hole. So this walks the block structure
+     * by hand and builds EVERY node with createElement — text is always a text
+     * node, never HTML. Links are restricted to http/https/mailto/# targets.
+     * Supported: headings, bold/italic, inline code, links, fenced code,
+     * unordered/ordered lists, blockquotes, horizontal rules and GFM tables.
+     * ------------------------------------------------------------------ */
+
+    /** Only these URL schemes may become a link target. */
+    function safeMarkdownUrl(raw) {
+      const url = String(raw).trim();
+      if (url.startsWith('#')) return url;
+      if (/^(https?:|mailto:)/i.test(url)) return url;
+      return null;
+    }
+
+    /**
+     * Inline markup -> an array of React children. A single regex with named
+     * alternatives keeps the scanner linear and avoids nested-string recursion;
+     * `**bold**`, `*em*`, `` `code` `` and `[text](url)` are all handled here.
+     */
+    function renderInline(text) {
+      const out = [];
+      const pattern = /(\*\*([^*]+)\*\*|__([^_]+)__|\*([^*\n]+)\*|_([^_\n]+)_|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\))/g;
+      let last = 0;
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        if (match.index > last) out.push(text.slice(last, match.index));
+        const token = match[0];
+        if (token.startsWith('**') || token.startsWith('__')) {
+          out.push(h('strong', { key: match.index }, match[2] ?? match[3]));
+        } else if (token.startsWith('`')) {
+          out.push(h('code', { key: match.index, className: 'mrf-mdCode' }, match[6]));
+        } else if (token.startsWith('[')) {
+          const url = safeMarkdownUrl(match[8]);
+          // An unsafe scheme degrades to plain text instead of a live link.
+          out.push(url === null
+            ? match[7]
+            : h('a', { key: match.index, href: url, target: '_blank', rel: 'noopener noreferrer' }, match[7]));
+        } else {
+          out.push(h('em', { key: match.index }, match[4] ?? match[5]));
+        }
+        last = match.index + token.length;
+      }
+      if (last < text.length) out.push(text.slice(last));
+      return out;
+    }
+
+    /** Split a table row on unescaped pipes, dropping the outer empty cells. */
+    function splitTableRow(line) {
+      const cells = line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|');
+      return cells.map((cell) => cell.trim());
+    }
+
+    /** Is `line` a GFM delimiter row like `| --- | :---: | ---: |`? */
+    function isTableDelimiter(line) {
+      const cells = splitTableRow(line);
+      return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+    }
+
+    /** Render a whole Markdown document into React elements (no innerHTML). */
+    function MarkdownBody(props) {
+      const { content } = props;
+      const lines = String(content ?? '').replace(/\r\n?/g, '\n').split('\n');
+      const blocks = [];
+      let i = 0;
+      let key = 0;
+
+      while (i < lines.length) {
+        const line = lines[i];
+
+        // Fenced code block: collect verbatim until the closing fence.
+        const fence = /^```\s*([^`]*)$/.exec(line);
+        if (fence) {
+          const code = [];
+          i += 1;
+          while (i < lines.length && !/^```\s*$/.test(lines[i])) { code.push(lines[i]); i += 1; }
+          if (i < lines.length) i += 1;
+          blocks.push(h('pre', { key: key++, className: 'mrf-mdPre' },
+            h('code', { className: 'mrf-mdCode' }, code.join('\n'))));
+          continue;
+        }
+
+        // Blank line: just skip it (paragraph separation is implicit).
+        if (line.trim() === '') { i += 1; continue; }
+
+        // Horizontal rule.
+        if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+          blocks.push(h('hr', { key: key++, className: 'mrf-mdHr' }));
+          i += 1;
+          continue;
+        }
+
+        // ATX heading (# .. ######).
+        const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+        if (heading) {
+          const level = heading[1].length;
+          blocks.push(h(`h${level}`, { key: key++, className: `mrf-mdH mrf-mdH${level}` }, renderInline(heading[2].replace(/\s+#+\s*$/, ''))));
+          i += 1;
+          continue;
+        }
+
+        // Blockquote: consume consecutive `>` lines into one quote block.
+        if (/^\s*>/.test(line)) {
+          const quoted = [];
+          while (i < lines.length && /^\s*>/.test(lines[i])) {
+            quoted.push(lines[i].replace(/^\s*>\s?/, ''));
+            i += 1;
+          }
+          blocks.push(h('blockquote', { key: key++, className: 'mrf-mdQuote' }, renderInline(quoted.join(' '))));
+          continue;
+        }
+
+        // GFM table: a header row immediately followed by a delimiter row.
+        if (line.includes('|') && i + 1 < lines.length && isTableDelimiter(lines[i + 1])) {
+          const header = splitTableRow(line);
+          i += 2;
+          const rows = [];
+          while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
+            rows.push(splitTableRow(lines[i]));
+            i += 1;
+          }
+          const headRow = h('tr', null, header.map((cell, c) =>
+            h('th', { key: c }, renderInline(cell))));
+          const bodyRows = rows.map((row, r) => h('tr', { key: r },
+            header.map((_, c) => h('td', { key: c }, row[c] !== undefined ? renderInline(row[c]) : null))));
+          const table = h('table', { className: 'mrf-mdTable' },
+            h('thead', null, headRow),
+            h('tbody', null, bodyRows));
+          blocks.push(h('div', { key: key++, className: 'mrf-mdTableWrap' }, table));
+          continue;
+        }
+
+        // Unordered / ordered list: keep consecutive items of the same kind.
+        const ul = /^\s*[-*+]\s+(.*)$/.exec(line);
+        const ol = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+        if (ul || ol) {
+          const ordered = ul === null;
+          const items = [];
+          while (i < lines.length) {
+            const m = ordered
+              ? /^\s*\d+[.)]\s+(.*)$/.exec(lines[i])
+              : /^\s*[-*+]\s+(.*)$/.exec(lines[i]);
+            if (!m) break;
+            items.push(h('li', { key: items.length }, renderInline(m[1])));
+            i += 1;
+          }
+          blocks.push(h(ordered ? 'ol' : 'ul', { key: key++, className: 'mrf-mdList' }, items));
+          continue;
+        }
+
+        // Paragraph: join consecutive non-blank, non-block lines with a space.
+        const para = [line];
+        i += 1;
+        while (i < lines.length && lines[i].trim() !== ''
+          && !/^```|^\s*>|^#{1,6}\s|^\s*(-{3,}|\*{3,}|_{3,})\s*$|^\s*[-*+]\s|^\s*\d+[.)]\s/.test(lines[i])) {
+          para.push(lines[i]);
+          i += 1;
+        }
+        blocks.push(h('p', { key: key++, className: 'mrf-mdP' }, renderInline(para.join(' '))));
+      }
+
+      return h('div', { className: 'mrf-markdown' }, blocks);
+    }
+
+    /** True for file names the panel should offer a Markdown preview for. */
+    function isMarkdownPath(path) {
+      return /\.(md|markdown|mdown|mkd)$/i.test(String(path ?? ''));
+    }
     /* ---------------------------------------------------------- preview */
 
     /** Rendered line cap: the preview is read-only, so a huge file is clipped. */
     const PREVIEW_LINE_CAP = 4000;
 
     function PreviewPane(props) {
-      const { preview, t, onClose, decoration } = props;
+      const { preview, t, onClose, decoration, onContextMenu } = props;
       const value = preview.value;
       // The open file carries the same git state the tree shows: the reader
       // must not have to look back at the tree to know whether the file in
@@ -596,6 +823,34 @@ window.__ModuleLoader__.load({
       const status = decoration.statuses[key];
       const ignored = decoration.ignored.has(key);
       const ink = status ? (STATUS_INK[status.letter] ?? STATUS_INK.M) : undefined;
+
+      // Markdown files open as a RENDERED document. The explorer already has
+      // the whole file text (`value.content`), so no extra host read is needed.
+      // "源码" falls back to the original line-by-line view; the toggle only
+      // exists for a text .md-ish file (not an image or a binary blob).
+      const isMd = isMarkdownPath(preview.path)
+        && preview.image === undefined
+        && value?.kind !== 'binary'
+        && value?.kind !== 'too-large';
+      const [view, setView] = useState('preview');
+      useEffect(() => { setView('preview'); }, [preview.path]);
+
+      const toggle = isMd
+        ? h('div', { className: 'mrf-mdToggle' },
+          h('button', {
+            type: 'button',
+            className: view === 'preview' ? 'mrf-mdToggleBtn mrf-mdToggleActive' : 'mrf-mdToggleBtn',
+            title: t('markdownPreviewTitle'),
+            onClick: () => setView('preview')
+          }, t('markdownPreview')),
+          h('button', {
+            type: 'button',
+            className: view === 'source' ? 'mrf-mdToggleBtn mrf-mdToggleActive' : 'mrf-mdToggleBtn',
+            title: t('markdownSourceTitle'),
+            onClick: () => setView('source')
+          }, t('markdownSource')))
+        : null;
+
       let body;
       if (preview.phase === 'loading') {
         body = h('div', { className: 'mrf-note mrf-pad' }, t('previewLoading'));
@@ -619,6 +874,8 @@ window.__ModuleLoader__.load({
       } else if (value?.kind === 'too-large') {
         body = h('div', { className: 'mrf-note mrf-pad' },
           `${t('previewTooLarge')}${value.size === undefined ? '' : ` · ${formatSize(value.size)}`}`);
+      } else if (isMd && view === 'preview') {
+        body = h('div', { className: 'mrf-mdScroll' }, h(MarkdownBody, { content: String(value?.content ?? '') }));
       } else {
         const lines = String(value?.content ?? '').replace(/\r\n/g, '\n').split('\n');
         const shown = lines.slice(0, PREVIEW_LINE_CAP);
@@ -648,7 +905,8 @@ window.__ModuleLoader__.load({
         h('div', { className: 'mrf-previewBar' },
           h('span', {
             className: `mrf-previewTitle${ink !== undefined ? ` mrf-tone-${ink.cls}` : ''}`,
-            title: preview.path
+            title: preview.path,
+            onContextMenu: (event) => onContextMenu?.(event, preview.path, false)
           }, preview.name),
           ignored ? h('span', { className: 'mrf-previewTag' }, t('ignored')) : null,
           ink !== undefined
@@ -658,6 +916,7 @@ window.__ModuleLoader__.load({
                 title: isZh() ? ink.zh : ink.word
               }, status.letter)
             : null,
+          toggle,
           h('button', {
             type: 'button',
             className: 'mrf-iconButton',
@@ -666,6 +925,127 @@ window.__ModuleLoader__.load({
             onClick: onClose
           }, '\u00d7')),
         body);
+    }
+
+    /* -------------------------------------------------------- clipboard
+                                                           and open */
+
+    /**
+     * Copy one absolute path to the clipboard. The async Clipboard API needs a
+     * focus+permission combination a sandboxed panel does not always have, so
+     * the legacy `execCommand('copy')` path stays as the fallback.
+     */
+    async function copyTextToClipboard(text) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch { /* fall through to the legacy path */ }
+      try {
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.setAttribute('readonly', '');
+        area.style.position = 'fixed';
+        area.style.top = '-1000px';
+        area.style.opacity = '0';
+        document.body.appendChild(area);
+        area.select();
+        const ok = document.execCommand('copy');
+        area.remove();
+        return ok;
+      } catch {
+        return false;
+      }
+    }
+
+    /** Ask the host to reveal `path` in the OS file manager. */
+    async function openInFileManager(ctx, path) {
+      const parsed = await postPlain(ctx, `${API_BASE}/open`, { path });
+      if (parsed?.ok !== true) {
+        throw new Error(typeof parsed?.error === 'string' && parsed.error !== '' ? parsed.error : 'open failed');
+      }
+    }
+
+    /** One ephemeral toast; the caller lets it expire on its own. */
+    function Toast(props) {
+      if (!props.message) return null;
+      return h('div', { className: 'mrf-toast', role: 'status' }, props.message);
+    }
+
+    /** The two-action context menu: copy the path, open the file manager. */
+    function ContextMenu(props) {
+      const { menu, t, onCopy, onOpen } = props;
+      const menuRef = useRef(null);
+      // Clamp into the panel after layout: offsetParent is the positioned
+      // ancestor (.mrf-panel), so menu offset coords and its client size are
+      // measured in the same coordinate space. Runs in the same frame as the
+      // mount, before the browser paints — no flicker.
+      useLayoutEffect(() => {
+        const el = menuRef.current;
+        const parent = el?.offsetParent;
+        if (!(el instanceof HTMLElement) || !(parent instanceof HTMLElement)) return;
+        const maxX = Math.max(0, parent.clientWidth - el.offsetWidth);
+        const maxY = Math.max(0, parent.clientHeight - el.offsetHeight);
+        const left = Math.min(Math.max(menu.x, 0), maxX);
+        const top = Math.min(Math.max(menu.y, 0), maxY);
+        if (left !== el.offsetLeft || top !== el.offsetTop) {
+          el.style.left = `${left}px`;
+          el.style.top = `${top}px`;
+        }
+      }, [menu]);
+      if (menu === null || menu === undefined) return null;
+      return h('div', {
+        className: 'mrf-menu',
+        role: 'menu',
+        ref: menuRef,
+        style: { left: `${Math.max(menu.x, 0)}px`, top: `${Math.max(menu.y, 0)}px` }
+      },
+      h('button', {
+        type: 'button', role: 'menuitem', className: 'mrf-menuItem',
+        onClick: () => onCopy(menu.path)
+      }, t('copyPath')),
+      h('button', {
+        type: 'button', role: 'menuitem', className: 'mrf-menuItem',
+        onClick: () => onOpen(menu.path)
+      }, t('openInFiles')));
+    }
+
+    /**
+     * Font-size control for the toolbar: A− / percentage / A+ / reset.
+     * The parent owns `scale` and persists it through /settings; this control
+     * is stateless so a failed write cannot leave UI and disk disagreeing.
+     */
+    function FontSizeControl(props) {
+      const { scale, t, onChange } = props;
+      const percent = Math.round(scale * 100);
+      const clamp = (value) => Math.min(FONT_MAX, Math.max(FONT_MIN, Math.round(value * 10) / 10));
+      const label = t('fontScaleTitle', { percent });
+      return h('div', { className: 'mrf-fontControl', title: label },
+        h('span', { className: 'mrf-fontLabel' }, t('fontSize')),
+        h('button', {
+          type: 'button',
+          className: 'mrf-fontBtn',
+          title: t('fontSmaller'),
+          'aria-label': t('fontSmaller'),
+          disabled: scale <= FONT_MIN + 0.001,
+          onClick: () => onChange(clamp(scale - FONT_STEP))
+        }, 'A−'),
+        h('button', {
+          type: 'button',
+          className: 'mrf-fontValue',
+          title: t('fontReset'),
+          'aria-label': `${label} · ${t('fontReset')}`,
+          onDoubleClick: () => onChange(FONT_DEFAULT)
+        }, `${percent}%`),
+        h('button', {
+          type: 'button',
+          className: 'mrf-fontBtn',
+          title: t('fontLarger'),
+          'aria-label': t('fontLarger'),
+          disabled: scale >= FONT_MAX - 0.001,
+          onClick: () => onChange(clamp(scale + FONT_STEP))
+        }, 'A+'));
     }
 
     /* ------------------------------------------------------------ panel */
@@ -684,6 +1064,12 @@ window.__ModuleLoader__.load({
       const [pickedRoot, setPickedRoot] = useState('');
       const [preview, setPreview] = useState(null);
       const [decoration, setDecoration] = useState(EMPTY_DECORATION);
+      /** The open context menu, positioned relative to the panel's top-left. */
+      const [contextMenu, setContextMenu] = useState(null);
+      /** The current toast: `{ key, at }` or null; `at` re-arms the timer. */
+      const [toast, setToast] = useState(null);
+      /** The panel root: context-menu coordinates are relative to it. */
+      const panelRef = useRef(null);
 
       /** The sidebar's own file-type icon resolver; undefined until published. */
       const [fileIcon, setFileIcon] = useState(null);
@@ -695,6 +1081,33 @@ window.__ModuleLoader__.load({
        */
       const ctxRef = useRef(ctx);
       ctxRef.current = ctx;
+
+      // Durable font scale, read from THIS plugin's /settings on mount and
+      // written back on every change. It is deliberately separate from
+      // dsh-multi-root-changes' setting: the two panels are independent.
+      const [fontScale, setFontScale] = useState(FONT_DEFAULT);
+      useEffect(() => {
+        let live = true;
+        fetchJson(ctxRef.current, `${API_BASE}/settings`)
+          .then((reply) => {
+            if (!live) return;
+            const value = Number(reply?.fontScale);
+            if (Number.isFinite(value)) setFontScale(Math.min(FONT_MAX, Math.max(FONT_MIN, value)));
+          })
+          .catch(() => { /* first run / host half not loaded yet: keep default */ });
+        return () => { live = false; };
+      }, []);
+      const changeFontScale = useCallback((next) => {
+        const value = Math.min(FONT_MAX, Math.max(FONT_MIN, Math.round(next * 10) / 10));
+        setFontScale(value);
+        postPlain(ctxRef.current, `${API_BASE}/settings`, { fontScale: value })
+          .then((reply) => {
+            const saved = Number(reply?.fontScale);
+            if (Number.isFinite(saved)) setFontScale(saved);
+          })
+          .catch(() => { /* keep the chosen size for this session */ });
+      }, []);
+
       useEffect(() => {
         const read = () => {
           const service = ctxRef.current.get?.('betterSidebar');
@@ -1008,13 +1421,90 @@ window.__ModuleLoader__.load({
         setPreview(null);
       }, []);
 
+      /* ------------------------------------------- context menu and toast */
+
+      const closeMenu = useCallback(() => setContextMenu(null), []);
+
+      /** One context menu for rows AND the root/preview titles. */
+      const handleContextMenu = useCallback((event, path, isDir) => {
+        if (typeof path !== 'string' || path === '') return;
+        event.preventDefault();
+        const wrap = panelRef.current;
+        const rect = wrap instanceof HTMLElement ? wrap.getBoundingClientRect() : null;
+        const x = rect === null ? event.clientX : event.clientX - rect.left;
+        const y = rect === null ? event.clientY : event.clientY - rect.top;
+        setContextMenu({ path, isDir: isDir === true, x, y });
+      }, []);
+
+      /** A click outside the menu, a blur or Escape closes it. */
+      useEffect(() => {
+        if (contextMenu === null) return undefined;
+        // One stable closer per effect run: two separate `.bind()` calls would
+        // create two different function objects and the removal would never
+        // match the registration.
+        const close = () => setContextMenu(null);
+        const onClick = (event) => {
+          const menu = panelRef.current?.querySelector('.mrf-menu');
+          if (menu !== null && menu !== undefined && event.target instanceof Node
+            && menu.contains(event.target)) return;
+          close();
+        };
+        const onKey = (event) => { if (event.key === 'Escape') close(); };
+        window.addEventListener('click', onClick, true);
+        window.addEventListener('resize', close);
+        window.addEventListener('keydown', onKey);
+        return () => {
+          window.removeEventListener('click', onClick, true);
+          window.removeEventListener('resize', close);
+          window.removeEventListener('keydown', onKey);
+        };
+      }, [contextMenu]);
+
+      /** The toast expires on its own; a new toast re-arms the timer. */
+      useEffect(() => {
+        if (toast === null) return undefined;
+        const timer = setTimeout(() => setToast(null), 1800);
+        return () => clearTimeout(timer);
+      }, [toast]);
+
+      /** Copy one absolute path; the toast reports the outcome. */
+      const copyPath = useCallback(async (path) => {
+        const ok = await copyTextToClipboard(displayPath(path));
+        setToast({ key: ok ? 'copiedPath' : 'copyFailed', at: Date.now() });
+      }, []);
+
+      /** Reveal one path in the OS file manager through the host's /open route. */
+      const openEntryInFiles = useCallback(async (path) => {
+        try {
+          await openInFileManager(ctxRef.current, path);
+          setToast({ key: 'openedInFiles', at: Date.now() });
+        } catch (error) {
+          setToast({ key: 'openFailed', at: Date.now() });
+          console.warn('[dsh-multi-root-files] open failed:',
+            error instanceof Error ? error.message : error);
+        }
+      }, []);
+
+      const menuCopy = useCallback((path) => {
+        closeMenu();
+        void copyPath(path);
+      }, [closeMenu, copyPath]);
+
+      const menuOpen = useCallback((path) => {
+        closeMenu();
+        void openEntryInFiles(path);
+      }, [closeMenu, openEntryInFiles]);
+
       const primaryRoot = roots.find((root) => root && root.kind === 'primary') ?? roots[0];
       const activeRoot = roots.find((root) => root && root.path === pickedRoot) ?? primaryRoot;
 
       const busy = phase === 'loading';
 
       return h('div', {
+        ref: panelRef,
         className: 'mrf-panel',
+        // ONE variable scales every fixed-px font-size in the injected CSS.
+        style: { '--mrf-scale': fontScale },
         'data-preview': preview !== null ? 'true' : 'false',
         // A read-only tally of the git decoration the tree is drawing: it
         // says at a glance whether the states were fetched at all.
@@ -1039,7 +1529,8 @@ window.__ModuleLoader__.load({
             'aria-label': t('refresh'),
             disabled: busy,
             onClick: () => { void load(); }
-          }, '\u21bb')),
+          }, '\u21bb'),
+          h(FontSizeControl, { scale: fontScale, t, onChange: changeFontScale })),
         h('div', { className: 'mrf-split' },
           h('div', { className: 'mrf-treeWrap' },
             h('div', { className: 'mrf-body' },
@@ -1060,12 +1551,15 @@ window.__ModuleLoader__.load({
                     onToggleRoot: toggleRoot,
                     onToggleDir: toggleDir,
                     onOpenFile: openEntry,
+                    onContextMenu: handleContextMenu,
                     t,
                     decoration,
                     fileIcon
                   })
                 : null)),
-          preview !== null ? h(PreviewPane, { preview, t, onClose: closePreview, decoration }) : null));
+          preview !== null ? h(PreviewPane, { preview, t, onClose: closePreview, decoration, onContextMenu: handleContextMenu }) : null),
+        h(ContextMenu, { menu: contextMenu, t, onCopy: menuCopy, onOpen: menuOpen }),
+        h(Toast, { message: toast === null ? '' : t(toast.key) }));
     }
 
     /* --------------------------------------------------------------- CSS */
@@ -1079,7 +1573,10 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-primary); font-size: 12px;
   background: var(--dsw-alias-bg-layer-1, var(--dsw-alias-bg-base, #161b19));
   background-color: var(--dsw-alias-bg-layer-1, #161b19);
-  isolation: isolate; }
+  isolation: isolate; position: relative; }
+/* The tree rows and the preview bar opt out of the browser's own menu so the
+   two-action menu can take over. */
+.mrf-body button, .mrf-previewBar { -webkit-user-select: none; user-select: none; }
 .mrf-bar { display: flex; align-items: center; gap: 8px; padding: 6px 8px;
   border-bottom: 1px solid var(--dsw-alias-border-l1); flex: none; }
 .mrf-title { font-weight: 600; flex: none; }
@@ -1095,6 +1592,17 @@ window.__ModuleLoader__.load({
 .mrf-refresh:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover);
   color: var(--dsw-alias-label-primary); }
 .mrf-refresh:disabled { opacity: .45; cursor: default; }
+/* Font-size control: fixed slot at the right end of the toolbar. */
+.mrf-fontControl { display: inline-flex; align-items: center; gap: 4px; flex: none; }
+.mrf-fontLabel { color: var(--dsw-alias-label-tertiary); font-size: 10px; white-space: nowrap; }
+.mrf-fontBtn, .mrf-fontValue { border: 1px solid var(--dsw-alias-border-l2);
+  background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer;
+  font: inherit; font-size: 11px; border-radius: 4px; height: 20px; }
+.mrf-fontBtn { width: 24px; font-weight: 600; }
+.mrf-fontValue { min-width: 44px; }
+.mrf-fontBtn:hover:not(:disabled), .mrf-fontValue:hover {
+  background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.mrf-fontBtn:disabled { opacity: .4; cursor: default; }
 .mrf-notice { flex: none; padding: 4px 8px; font-size: 11px;
   color: var(--dsw-alias-state-error-primary);
   border-bottom: 1px solid var(--dsw-alias-border-l1); }
@@ -1194,6 +1702,42 @@ window.__ModuleLoader__.load({
 .mrf-code { flex: 1; min-height: 0; overflow: auto; padding: 4px 0;
   font-family: var(--ds-font-family-code); font-size: 11px; }
 .mrf-codeLine { display: flex; gap: 8px; padding: 0 8px; white-space: pre; }
+/* Markdown preview: rendered document instead of line-by-line source. */
+.mrf-mdToggle { display: flex; gap: 4px; flex: none; }
+.mrf-mdToggleBtn { border: 1px solid var(--dsw-alias-border-l2); border-radius: 4px;
+  background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer;
+  font: inherit; font-size: 10px; padding: 1px 8px; }
+.mrf-mdToggleBtn:hover { background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary); }
+.mrf-mdToggleActive { border-color: var(--dsw-alias-state-business-primary);
+  color: var(--dsw-alias-state-business-primary); font-weight: 600; }
+.mrf-mdScroll { flex: 1; min-height: 0; overflow: auto; padding: 10px 14px; }
+.mrf-markdown { color: var(--dsw-alias-label-primary); font-size: 12px; line-height: 1.65;
+  word-wrap: break-word; }
+.mrf-markdown .mrf-mdH { margin: 14px 0 6px; line-height: 1.3; font-weight: 700; }
+.mrf-markdown .mrf-mdH1 { font-size: 19px; border-bottom: 1px solid var(--dsw-alias-border-l1); padding-bottom: 4px; }
+.mrf-markdown .mrf-mdH2 { font-size: 16px; border-bottom: 1px solid var(--dsw-alias-border-l1); padding-bottom: 3px; }
+.mrf-markdown .mrf-mdH3 { font-size: 14px; }
+.mrf-markdown .mrf-mdH4, .mrf-markdown .mrf-mdH5, .mrf-markdown .mrf-mdH6 { font-size: 12px; }
+.mrf-markdown .mrf-mdP { margin: 6px 0; }
+.mrf-markdown .mrf-mdList { margin: 6px 0; padding-left: 22px; }
+.mrf-markdown .mrf-mdList li { margin: 2px 0; }
+.mrf-markdown .mrf-mdQuote { margin: 8px 0; padding: 2px 10px;
+  border-left: 3px solid var(--dsw-alias-state-business-primary);
+  color: var(--dsw-alias-label-secondary); }
+.mrf-markdown .mrf-mdHr { border: 0; border-top: 1px solid var(--dsw-alias-border-l1); margin: 12px 0; }
+.mrf-markdown a { color: var(--dsw-alias-state-business-primary); }
+.mrf-markdown .mrf-mdCode { font-family: var(--ds-font-family-code); font-size: 11px;
+  background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,.18)); border-radius: 3px; padding: 1px 4px; }
+.mrf-markdown .mrf-mdPre { overflow: auto; margin: 8px 0; padding: 8px 10px;
+  background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,.18));
+  border: 1px solid var(--dsw-alias-border-l1); border-radius: 4px; }
+.mrf-markdown .mrf-mdPre .mrf-mdCode { background: transparent; padding: 0; }
+.mrf-markdown .mrf-mdTableWrap { overflow-x: auto; }
+.mrf-markdown .mrf-mdTable { border-collapse: collapse; margin: 8px 0; font-size: 11px; }
+.mrf-markdown .mrf-mdTable th, .mrf-markdown .mrf-mdTable td {
+  border: 1px solid var(--dsw-alias-border-l2); padding: 3px 8px; text-align: left; }
+.mrf-markdown .mrf-mdTable th { background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,.18)); font-weight: 600; }
 /* The changed rows carry the diff's ink: an added row is green, a removed one
    red. The tint is a wash and the line number is coloured too, so a change is
    legible even on an empty line. */
@@ -1214,13 +1758,46 @@ window.__ModuleLoader__.load({
 .mrf-noteError { color: var(--dsw-alias-state-error-primary); }
 .mrf-pad { padding: 12px 8px; }
 .mrf-indent { padding-left: 30px; }
+/* The two-action context menu. It is positioned INSIDE the panel (the
+   coordinates were computed relative to it), so a long menu can never escape
+   the narrow sidebar column; the max-height cap keeps it visible on short
+   panels. */
+.mrf-menu { position: absolute; z-index: 40; min-width: 170px; max-height: 45%;
+  overflow: auto; padding: 4px; border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-2, #22262a);
+  border: 1px solid var(--dsw-alias-border-l2);
+  box-shadow: 0 6px 18px rgba(0,0,0,.4); isolation: isolate; }
+.mrf-menuItem { display: block; width: 100%; border: 0; background: transparent;
+  color: var(--dsw-alias-label-primary); font: inherit; font-size: 12px;
+  text-align: left; padding: 5px 10px; border-radius: 4px; cursor: pointer;
+  white-space: nowrap; }
+.mrf-menuItem:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.mrf-menuItem:focus-visible { outline: 1px solid var(--dsw-alias-state-business-primary); }
+/* The one-line outcome toast (path copied / open failed). It sits above the
+   bottom edge so it never covers the row that was clicked. */
+.mrf-toast { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%);
+  z-index: 41; max-width: calc(100% - 24px); padding: 5px 12px; border-radius: 6px;
+  font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-2, #22262a);
+  border: 1px solid var(--dsw-alias-border-l2);
+  box-shadow: 0 4px 12px rgba(0,0,0,.35); pointer-events: none; }
 `;
 
+    /**
+     * Inject the panel stylesheet once. Every `font-size: Npx` becomes
+     * `calc(Npx * var(--mrf-scale, 1))`, so one variable set on the panel root
+     * scales ALL fixed-px text (tree, preview, toolbar, markdown) together.
+     * The variable is scoped to .mrf-panel and cannot affect the shell around
+     * it. `font: inherit` controls follow automatically.
+     */
     function ensureStyle() {
       if (document.getElementById(STYLE_ID) !== null) return;
+      const scaled = CSS.replace(/font-size:\s*(\d+(?:\.\d+)?)px/g,
+        (_match, px) => `font-size: calc(${px}px * var(--mrf-scale, 1))`);
       const element = document.createElement('style');
       element.id = STYLE_ID;
-      element.textContent = CSS;
+      element.textContent = scaled;
       document.head.appendChild(element);
     }
 
