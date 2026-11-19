@@ -96,5 +96,27 @@ check('ensureStyle rewrites font-size to calc()', /CSS\.replace\(\/font-size:\\s
 check('toolbar renders FontSizeControl', /h\(FontSizeControl, \{ scale: fontScale/.test(clientSrc) && /function FontSizeControl/.test(clientSrc));
 check('A− / A+ / reset present', /t\('fontSmaller'\)/.test(clientSrc) && /t\('fontLarger'\)/.test(clientSrc) && /onDoubleClick: \(\) => onChange\(FONT_DEFAULT\)/.test(clientSrc));
 
+console.log('\n=== image preview: thumbnail + full-window lightbox ===');
+check('react-dom createPortal available', /require\('react-dom'\)/.test(clientSrc) && /createPortal/.test(clientSrc));
+check('ImageLightbox component present', /function ImageLightbox\(props\)/.test(clientSrc));
+check('lightbox portaled to document.body', /createPortal\(content, host\)/.test(clientSrc) && /document\.body/.test(clientSrc));
+check('inline stage centres thumbnail', /\.mrf-imageStage\s*\{[^}]*justify-content:\s*center/.test(clientSrc) && /\.mrf-imageStage\s*\{[^}]*align-items:\s*center/s.test(clientSrc));
+check('inline dblclick opens lightbox', /onDoubleClick:\s*\(\)\s*=>\s*setLightboxOpen\(true\)/.test(clientSrc));
+check('lightbox closes when file changes', /setLightboxOpen\(false\); \}, \[preview\.path\]\)/.test(clientSrc));
+check('lightbox mounts when open', /lightboxOpen && isImage\s*\n\s*\? h\(ImageLightbox/.test(clientSrc));
+check('zoom constants defined', /ZOOM_MIN\s*=/.test(clientSrc) && /ZOOM_MAX\s*=/.test(clientSrc) && /ZOOM_STEP\s*=/.test(clientSrc) && /ZOOM_DEFAULT\s*=/.test(clientSrc));
+check('transform = translate(pan) scale(zoom)', /transform:\s*`translate\(\$\{pan\.x\}px, \$\{pan\.y\}px\) scale\(\$\{zoom\}\)`/.test(clientSrc));
+check('pointer-centred zoom math present', /px - \(px - p0\.x\) \* ratio/.test(clientSrc) && /py - \(py - p0\.y\) \* ratio/.test(clientSrc));
+check('drag-to-pan via pointer events', /addEventListener\('pointermove', move\)/.test(clientSrc) && /drag\.pan\.x \+ \(ev\.clientX - drag\.x\)/.test(clientSrc));
+check('wheel zoom handler is non-passive', /addEventListener\('wheel', onWheel, \{ passive: false \}\)/.test(clientSrc));
+check('Esc closes lightbox', /event\.key === 'Escape'\) onClose\(\)/.test(clientSrc));
+check('lightbox is centred with margins (window controls reachable)', /\.mrf-lb\s*\{[^}]*position:\s*fixed[^}]*inset:\s*48px 72px 40px/s.test(clientSrc));
+check('lightbox fits image inside its own box', /\.mrf-lbImage\s*\{[^}]*max-width:\s*100%[^}]*max-height:\s*100%/s.test(clientSrc));
+check('open-folder button in preview bar', /title:\s*t\('imageOpenFolder'\)/.test(clientSrc) && /onClick:\s*\(\)\s*=>\s*onOpenFolder\(preview\.path\)/.test(clientSrc));
+check('parent opens the containing folder', /onOpenFolder:\s*\(path\)\s*=>\s*openEntryInFiles\(parentDir\(path\)\)/.test(clientSrc));
+check('parentDir helper present', /function parentDir\(path\)/.test(clientSrc));
+check('open-folder uses host /open route', /function openInFileManager/.test(clientSrc) && /API_BASE\}\/open/.test(clientSrc));
+check('i18n lightbox strings in both locales', /imageOpen:/.test(clientSrc) && /imageDragHint:/.test(clientSrc) && /imageClose:/.test(clientSrc));
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED\n' : `\n${failures} CHECK(S) FAILED\n`);
 process.exit(failures === 0 ? 0 : 1);

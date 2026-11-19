@@ -24,6 +24,16 @@ window.__ModuleLoader__.load({
     'use strict';
 
     const React = require('react');
+    /**
+     * The image lightbox must cover the whole DSH window, not just the narrow
+     * sidebar column, so it is portaled to document.body. The loader exposes
+     * react-dom to every client module (dsh-better-sidebar et al. use it).
+     */
+    let createPortal = null;
+    try {
+      const ReactDOM = require('react-dom');
+      createPortal = ReactDOM && typeof ReactDOM.createPortal === 'function' ? ReactDOM.createPortal : null;
+    } catch { /* keep the inline preview if react-dom is unavailable */ }
     const {
       createElement: h,
       Fragment,
@@ -54,6 +64,11 @@ window.__ModuleLoader__.load({
     const FONT_MAX = 1.6;
     const FONT_STEP = 0.1;
     const FONT_DEFAULT = 1;
+    /** Image preview zoom: 1 = fit-to-pane; the wheel/buttons clamp here. */
+    const ZOOM_MIN = 0.25;
+    const ZOOM_MAX = 8;
+    const ZOOM_STEP = 0.25;
+    const ZOOM_DEFAULT = 1;
 
     const COPY = {
       zh: {
@@ -93,7 +108,18 @@ window.__ModuleLoader__.load({
         markdownPreview: '预览',
         markdownSource: '源码',
         markdownPreviewTitle: '按 Markdown 排版渲染全文',
-        markdownSourceTitle: '查看逐行源码'
+        markdownSourceTitle: '查看逐行源码',
+        imageZoomIn: '放大图片',
+        imageZoomOut: '缩小图片',
+        imageZoomReset: '恢复适应窗口（双击百分比）',
+        imageFit: '适应窗口',
+        imageOpenFolder: '在文件管理器打开所在文件夹',
+        imageZoomTitle: '当前 {percent}% · 滚轮缩放 / 按住拖动 / 双击适应窗口',
+        imageOpen: '在大图中查看（弹框）',
+        imageClose: '关闭大图（Esc）',
+        imageDragHint: '滚轮缩放 · 按住拖动查看',
+        imageLoading: '正在读取图片…',
+        imageError: '图片读取失败'
       },
       en: {
         tab: 'Multi-root files',
@@ -132,7 +158,18 @@ window.__ModuleLoader__.load({
         markdownPreview: 'Preview',
         markdownSource: 'Source',
         markdownPreviewTitle: 'Render the whole file as formatted Markdown',
-        markdownSourceTitle: 'Show the line-by-line source'
+        markdownSourceTitle: 'Show the line-by-line source',
+        imageZoomIn: 'Zoom in',
+        imageZoomOut: 'Zoom out',
+        imageZoomReset: 'Fit to window (double-click the percentage)',
+        imageFit: 'Fit to window',
+        imageOpenFolder: 'Open the containing folder in the file manager',
+        imageZoomTitle: 'Now {percent}% · wheel to zoom / drag to pan / double-click to fit',
+        imageOpen: 'View full size (popup)',
+        imageClose: 'Close full view (Esc)',
+        imageDragHint: 'Wheel to zoom · drag to pan',
+        imageLoading: 'Loading image…',
+        imageError: 'Could not load image'
       }
     };
 
@@ -420,6 +457,13 @@ window.__ModuleLoader__.load({
       return String(path).replace(/\//g, '\\');
     }
 
+    /** The containing folder of a file path (either separator style). */
+    function parentDir(path) {
+      const trimmed = String(path).replace(/[\\/]+$/, '');
+      const at = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+      return at === -1 ? trimmed : trimmed.slice(0, at);
+    }
+
     /* ---------------------------------------------------------------- icons */
 
     function FolderGlyph(props) {
@@ -455,6 +499,31 @@ window.__ModuleLoader__.load({
         width: 10, height: 10, viewBox: '0 0 12 12', fill: 'none', stroke: 'currentColor',
         strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true'
       }, h('path', { d: 'M4.5 2.5 8 6 4.5 9.5' }));
+    }
+
+    /** Magnifier with a plus (zoom in) or a minus (zoom out). */
+    function ZoomGlyph(props) {
+      const minus = props?.minus === true;
+      const size = props?.size ?? 14;
+      return h('svg', {
+        className: 'mrf-glyph', width: size, height: size, viewBox: '0 0 16 16',
+        fill: 'none', stroke: 'currentColor', strokeWidth: 1.4,
+        strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true'
+      },
+        h('circle', { cx: 6.6, cy: 6.6, r: 4.4 }),
+        h('path', { d: 'M9.8 9.8 14 14' }),
+        h('path', { d: minus ? 'M4.4 6.6h4.4' : 'M4.4 6.6h4.4M6.6 4.4v4.4' }));
+    }
+
+    /** "Fit to window" frame glyph (four corners). */
+    function FitGlyph(props) {
+      const size = props?.size ?? 14;
+      return h('svg', {
+        className: 'mrf-glyph', width: size, height: size, viewBox: '0 0 16 16',
+        fill: 'none', stroke: 'currentColor', strokeWidth: 1.4,
+        strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true'
+      },
+        h('path', { d: 'M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4' }));
     }
 
     /** A small inline glyph: two stacked folders, drawn in currentColor. */
@@ -808,13 +877,192 @@ window.__ModuleLoader__.load({
     function isMarkdownPath(path) {
       return /\.(md|markdown|mdown|mkd)$/i.test(String(path ?? ''));
     }
+    /* ------------------------------------------------------- lightbox */
+
+    /**
+     * Full-window image viewer. The inline preview is only a thumbnail: real
+     * zoom lives here because a magnified picture outgrows the narrow sidebar
+     * and cannot be panned there. The overlay is portaled to document.body so
+     * it covers the WHOLE DSH window.
+     *
+     * Transform model (transform-origin: center): a point `u` in image-centred
+     * coordinates maps to a screen offset from the stage centre of
+     *   s = pan + u * zoom
+     * so zooming about a pointer at offset `p` keeps that pixel fixed when
+     *   pan' = p - (p - pan) * (zoom' / zoom)
+     * Dragging just adds the pointer delta to `pan`.
+     */
+    function ImageLightbox(props) {
+      const { image, name, path, t, onClose, onOpenFolder } = props;
+      const [zoom, setZoom] = useState(ZOOM_DEFAULT);
+      const [pan, setPan] = useState({ x: 0, y: 0 });
+      const stageRef = useRef(null);
+      // Live values in refs so wheel/pointer handlers never read stale state.
+      const viewRef = useRef({ zoom: ZOOM_DEFAULT, pan: { x: 0, y: 0 } });
+      viewRef.current = { zoom, pan };
+      const dragRef = useRef(null);
+
+      const clampZoom = (next) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(next * 100) / 100));
+      const setView = useCallback((z, p) => {
+        const clamped = clampZoom(z);
+        setZoom(clamped);
+        setPan(p);
+        viewRef.current = { zoom: clamped, pan: p };
+      }, []);
+      const fit = useCallback(() => setView(ZOOM_DEFAULT, { x: 0, y: 0 }), [setView]);
+      const zoomAt = useCallback((factor, clientX, clientY) => {
+        const stage = stageRef.current;
+        if (!(stage instanceof HTMLElement)) { setView(clampZoom(viewRef.current.zoom * factor), viewRef.current.pan); return; }
+        const rect = stage.getBoundingClientRect();
+        // Pointer offset from the stage centre.
+        const px = clientX - (rect.left + rect.width / 2);
+        const py = clientY - (rect.top + rect.height / 2);
+        const { zoom: z0, pan: p0 } = viewRef.current;
+        const z1 = clampZoom(z0 * factor);
+        if (z1 === z0) return;
+        const ratio = z1 / z0;
+        setView(z1, {
+          x: px - (px - p0.x) * ratio,
+          y: py - (py - p0.y) * ratio
+        });
+      }, [setView]);
+      const zoomStep = (dir) => {
+        const stage = stageRef.current;
+        const rect = stage instanceof HTMLElement ? stage.getBoundingClientRect() : null;
+        const cx = rect ? rect.left + rect.width / 2 : 0;
+        const cy = rect ? rect.top + rect.height / 2 : 0;
+        zoomAt(dir > 0 ? 1 + ZOOM_STEP : 1 - ZOOM_STEP, cx, cy);
+      };
+
+      // Wheel zoom (non-passive so the page cannot scroll behind the overlay).
+      useEffect(() => {
+        const el = stageRef.current;
+        if (!(el instanceof HTMLElement)) return undefined;
+        const onWheel = (event) => {
+          event.preventDefault();
+          zoomAt(event.deltaY < 0 ? 1.12 : 1 / 1.12, event.clientX, event.clientY);
+        };
+        el.addEventListener('wheel', onWheel, { passive: false });
+        return () => el.removeEventListener('wheel', onWheel);
+      }, [zoomAt]);
+
+      // Pointer drag to pan. Move/up are bound to window so the drag survives
+      // leaving the image or the stage.
+      const onPointerDown = (event) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        dragRef.current = {
+          id: event.pointerId,
+          x: event.clientX, y: event.clientY,
+          pan: { ...viewRef.current.pan }
+        };
+        const move = (ev) => {
+          const drag = dragRef.current;
+          if (drag === null || ev.pointerId !== drag.id) return;
+          setView(viewRef.current.zoom, {
+            x: drag.pan.x + (ev.clientX - drag.x),
+            y: drag.pan.y + (ev.clientY - drag.y)
+          });
+        };
+        const up = (ev) => {
+          if (dragRef.current !== null && ev.pointerId !== dragRef.current.id) return;
+          dragRef.current = null;
+          window.removeEventListener('pointermove', move);
+          window.removeEventListener('pointerup', up);
+          window.removeEventListener('pointercancel', up);
+        };
+        window.addEventListener('pointermove', move);
+        window.addEventListener('pointerup', up);
+        window.addEventListener('pointercancel', up);
+      };
+
+      // Esc / arrow keys; lock the body scroll while the lightbox is open.
+      useEffect(() => {
+        const onKey = (event) => {
+          if (event.key === 'Escape') onClose();
+          else if (event.key === '+' || event.key === '=') zoomStep(1);
+          else if (event.key === '-') zoomStep(-1);
+          else if (event.key === '0') fit();
+        };
+        window.addEventListener('keydown', onKey);
+        const prevOverflow = document.body.style.overflow;
+        document.body.style.overflow = 'hidden';
+        return () => {
+          window.removeEventListener('keydown', onKey);
+          document.body.style.overflow = prevOverflow;
+        };
+      });
+
+      const content = h('div', {
+        className: 'mrf-lb',
+        role: 'dialog',
+        'aria-modal': 'true',
+        'aria-label': name
+      },
+        h('div', { className: 'mrf-lbBar' },
+          h('span', { className: 'mrf-lbName', title: path }, name),
+          h('span', { className: 'mrf-lbHint' }, t('imageDragHint')),
+          h('div', { className: 'mrf-lbTools' },
+            h('button', {
+              type: 'button', className: 'mrf-iconButton', title: t('imageZoomOut'),
+              'aria-label': t('imageZoomOut'), disabled: zoom <= ZOOM_MIN + 0.001,
+              onClick: () => zoomStep(-1)
+            }, h(ZoomGlyph, { minus: true })),
+            h('button', {
+              type: 'button', className: 'mrf-zoomValue', title: t('imageZoomReset'),
+              onDoubleClick: fit
+            }, `${Math.round(zoom * 100)}%`),
+            h('button', {
+              type: 'button', className: 'mrf-iconButton', title: t('imageZoomIn'),
+              'aria-label': t('imageZoomIn'), disabled: zoom >= ZOOM_MAX - 0.001,
+              onClick: () => zoomStep(1)
+            }, h(ZoomGlyph)),
+            h('button', {
+              type: 'button', className: 'mrf-iconButton', title: t('imageFit'),
+              'aria-label': t('imageFit'), onClick: fit
+            }, h(FitGlyph)),
+            onOpenFolder
+              ? h('button', {
+                  type: 'button', className: 'mrf-iconButton', title: t('imageOpenFolder'),
+                  'aria-label': t('imageOpenFolder'), onClick: () => onOpenFolder(path)
+                }, h(FolderGlyph))
+              : null,
+            h('button', {
+              type: 'button', className: 'mrf-iconButton mrf-closeButton', title: t('imageClose'),
+              'aria-label': t('imageClose'), onClick: onClose
+            }, '\u00d7'))),
+        h('div', {
+          className: 'mrf-lbStage',
+          ref: stageRef,
+          onPointerDown: onPointerDown,
+          onDoubleClick: (event) => {
+            event.preventDefault();
+            if (zoom === ZOOM_DEFAULT) zoomAt(2, event.clientX, event.clientY);
+            else fit();
+          }
+        },
+          h('img', {
+            className: 'mrf-lbImage',
+            src: image.src,
+            alt: name,
+            draggable: false,
+            style: { transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }
+          })));
+
+      // Portal to body when available; fall back to an inline fixed overlay.
+      const host = typeof document !== 'undefined' ? document.body : null;
+      return createPortal !== null && host !== null
+        ? createPortal(content, host)
+        : content;
+    }
+
     /* ---------------------------------------------------------- preview */
 
     /** Rendered line cap: the preview is read-only, so a huge file is clipped. */
     const PREVIEW_LINE_CAP = 4000;
 
     function PreviewPane(props) {
-      const { preview, t, onClose, decoration, onContextMenu } = props;
+      const { preview, t, onClose, onOpenFolder, decoration, onContextMenu } = props;
       const value = preview.value;
       // The open file carries the same git state the tree shows: the reader
       // must not have to look back at the tree to know whether the file in
@@ -835,6 +1083,14 @@ window.__ModuleLoader__.load({
       const [view, setView] = useState('preview');
       useEffect(() => { setView('preview'); }, [preview.path]);
 
+      // Inline preview is a thumbnail that fits the pane. Real zoom+pan lives
+      // in the full-window lightbox (opened from the toolbar or a dblclick),
+      // because a magnified picture outgrows this narrow column and cannot be
+      // panned here. Close the lightbox when the file changes.
+      const isImage = preview.image !== undefined && preview.image !== null;
+      const [lightboxOpen, setLightboxOpen] = useState(false);
+      useEffect(() => { setLightboxOpen(false); }, [preview.path]);
+
       const toggle = isMd
         ? h('div', { className: 'mrf-mdToggle' },
           h('button', {
@@ -851,22 +1107,45 @@ window.__ModuleLoader__.load({
           }, t('markdownSource')))
         : null;
 
+      // Inline image toolbar: open the full-window viewer + open the folder.
+      const imageTools = isImage
+        ? h('div', { className: 'mrf-imageTools' },
+          h('button', {
+            type: 'button',
+            className: 'mrf-iconButton',
+            title: t('imageOpen'),
+            'aria-label': t('imageOpen'),
+            onClick: () => setLightboxOpen(true)
+          }, h(ZoomGlyph)),
+          onOpenFolder
+            ? h('button', {
+                type: 'button',
+                className: 'mrf-iconButton',
+                title: t('imageOpenFolder'),
+                'aria-label': t('imageOpenFolder'),
+                onClick: () => onOpenFolder(preview.path)
+              }, h(FolderGlyph))
+            : null)
+        : null;
+
       let body;
       if (preview.phase === 'loading') {
         body = h('div', { className: 'mrf-note mrf-pad' }, t('previewLoading'));
       } else if (preview.phase === 'error') {
         body = h('div', { className: 'mrf-note mrf-noteError mrf-pad' },
           `${t('previewFailed')}: ${preview.error}`);
-      } else if (preview.image !== undefined && preview.image !== null) {
-        // A drawable image wins over the text: the bytes are there, so the
-        // picture is shown (the text read of a picture is meaningless).
-        body = h('div', { className: 'mrf-imageWrap' },
+      } else if (isImage) {
+        // Inline thumbnail: fit the picture inside the pane, centred. Double
+        // clicking opens the full-window lightbox for real zoom+pan.
+        body = h('div', { className: 'mrf-imageStage' },
           h('img', {
             className: 'mrf-image',
             src: preview.image.src,
-            alt: preview.name
+            alt: preview.name,
+            title: t('imageOpen'),
+            onDoubleClick: () => setLightboxOpen(true)
           }),
-          h('div', { className: 'mrf-note' },
+          h('div', { className: 'mrf-imageMeta' },
             `${preview.name}${preview.image.size === undefined ? '' : ` · ${formatSize(preview.image.size)}`}`));
       } else if (value?.kind === 'binary') {
         body = h('div', { className: 'mrf-note mrf-pad' },
@@ -917,14 +1196,25 @@ window.__ModuleLoader__.load({
               }, status.letter)
             : null,
           toggle,
+          imageTools,
           h('button', {
             type: 'button',
-            className: 'mrf-iconButton',
+            className: 'mrf-iconButton mrf-closeButton',
             title: t('close'),
             'aria-label': t('close'),
             onClick: onClose
           }, '\u00d7')),
-        body);
+        body,
+        lightboxOpen && isImage
+          ? h(ImageLightbox, {
+              image: preview.image,
+              name: preview.name,
+              path: preview.path,
+              t,
+              onClose: () => setLightboxOpen(false),
+              onOpenFolder
+            })
+          : null);
     }
 
     /* -------------------------------------------------------- clipboard
@@ -1557,7 +1847,15 @@ window.__ModuleLoader__.load({
                     fileIcon
                   })
                 : null)),
-          preview !== null ? h(PreviewPane, { preview, t, onClose: closePreview, decoration, onContextMenu: handleContextMenu }) : null),
+          preview !== null
+            ? h(PreviewPane, {
+                preview, t,
+                onClose: closePreview,
+                onOpenFolder: (path) => openEntryInFiles(parentDir(path)),
+                decoration,
+                onContextMenu: handleContextMenu
+              })
+            : null),
         h(ContextMenu, { menu: contextMenu, t, onCopy: menuCopy, onOpen: menuOpen }),
         h(Toast, { message: toast === null ? '' : t(toast.key) }));
     }
@@ -1745,12 +2043,61 @@ window.__ModuleLoader__.load({
 .mrf-lineAdded .mrf-lineNo { color: var(--dsw-alias-state-success-primary); font-weight: 700; }
 .mrf-lineRemoved { background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 16%, transparent); }
 .mrf-lineRemoved .mrf-lineNo { color: var(--dsw-alias-state-error-primary); font-weight: 700; }
-/* The picture preview: the image is drawn at its own size inside a padded
-   box that scrolls, so a large picture never squeezes the tree. */
-.mrf-imageWrap { flex: 1; min-height: 0; overflow: auto; padding: 8px;
-  display: flex; flex-direction: column; align-items: center; gap: 6px; }
-.mrf-image { max-width: 100%; height: auto; display: block;
-  border-radius: 4px; box-shadow: 0 1px 6px rgba(0,0,0,.35); }
+/* Image preview: a neutral stage fills the pane and centres the picture both
+   horizontally and vertically (the reference "middle" layout). The picture
+   scales about that centre; when zoomed past the pane the stage scrolls so no
+   part of the image becomes unreachable. */
+.mrf-imageStage { flex: 1; min-height: 0; overflow: auto; padding: 16px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; background: var(--dsw-alias-bg-layer-0, #101413); }
+.mrf-image { flex: none; max-width: 100%; max-height: calc(100% - 28px); width: auto; height: auto;
+  display: block;
+  border-radius: 4px; box-shadow: 0 1px 6px rgba(0,0,0,.35); cursor: zoom-in; }
+.mrf-imageMeta { flex: none; color: var(--dsw-alias-label-tertiary); font-size: 11px;
+  text-align: center; }
+/* Inline image toolbar: open-full + open-folder. */
+.mrf-imageTools { display: flex; align-items: center; gap: 2px; flex: none; margin-left: auto; }
+.mrf-iconButton:disabled { opacity: .4; cursor: default; }
+.mrf-closeButton { margin-left: 2px; }
+.mrf-zoomValue { flex: none; min-width: 44px; height: 20px; padding: 0 4px;
+  border: 1px solid var(--dsw-alias-border-l2); border-radius: 4px;
+  background: transparent; color: var(--dsw-alias-label-secondary);
+  font: inherit; font-size: 10px; cursor: pointer; }
+.mrf-zoomValue:hover { background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary); }
+
+/* Centred image lightbox (portaled to document.body). It is deliberately NOT
+   inset:0: the margin keeps the DSH window's top-right minimize / maximize /
+   close buttons and the draggable title area reachable, instead of an invisible
+   full-screen layer swallowing those clicks. It is still far larger than the
+   sidebar column, so a magnified image has room and can be dragged to reveal
+   any hidden part. These rules are outside .mrf-panel's font scaling. */
+.mrf-lb { position: fixed; inset: 48px 72px 40px; z-index: 2147483000;
+  display: flex; flex-direction: column;
+  background: rgba(14,17,16,.97); color: #eaeaea;
+  border: 1px solid rgba(255,255,255,.16); border-radius: 10px;
+  box-shadow: 0 18px 60px rgba(0,0,0,.6);
+  overflow: hidden; pointer-events: auto;
+  font-family: var(--ds-font-family-ui, system-ui, sans-serif); }
+.mrf-lbBar { flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,.12); }
+.mrf-lbName { min-width: 0; flex: none; max-width: 40vw; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--ds-font-family-code, monospace); font-size: 12px; font-weight: 600; }
+.mrf-lbHint { flex: 1; min-width: 0; text-align: center;
+  color: #9aa5a0; font-size: 11px; white-space: nowrap; }
+.mrf-lbTools { flex: none; display: flex; align-items: center; gap: 2px; }
+.mrf-lb .mrf-iconButton { width: 26px; height: 26px; font-size: 15px; color: #cfd6d2; }
+.mrf-lb .mrf-iconButton:hover:not(:disabled) { background: rgba(255,255,255,.12); color: #fff; }
+.mrf-lb .mrf-zoomValue { min-width: 52px; height: 26px; color: #cfd6d2;
+  border-color: rgba(255,255,255,.18); }
+.mrf-lbStage { flex: 1; min-height: 0; overflow: hidden; position: relative;
+  display: flex; align-items: center; justify-content: center;
+  cursor: grab; touch-action: none; }
+.mrf-lbStage:active { cursor: grabbing; }
+.mrf-lbImage { flex: none; max-width: 100%; max-height: 100%; width: auto; height: auto;
+  display: block; transform-origin: center center; will-change: transform;
+  box-shadow: 0 4px 30px rgba(0,0,0,.6); user-select: none; -webkit-user-drag: none; }
 .mrf-lineNo { flex: none; min-width: 34px; text-align: right; user-select: none;
   color: var(--dsw-alias-label-tertiary); }
 .mrf-lineText { white-space: pre; }
