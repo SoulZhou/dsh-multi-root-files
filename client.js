@@ -1,9 +1,10 @@
 /**
  * Browser half of dsh-multi-root-files.
  *
- * Registers one sidebar tab ("多根文件") through dsh-better-sidebar's
- * `ctx.betterSidebar.registerTab`, so the page lands in DSH's own right column
- * next to Files / Git / Tasks instead of becoming a parallel surface.
+ * Registers one tab ("多根文件") through DSH's NATIVE right-sidebar contract —
+ * `ctx.sidebarRightTabs.register` plus a `sidebar.right.pane.tab` body slot —
+ * so the page lands in DSH's own right column next to Files / Git / Tasks and a
+ * capsule appears on the native start page (no dsh-better-sidebar dependency).
  *
  * The page shows ONE root at a time: the session's primary root by default, any
  * root registered through multi-root-workspace picked from the toolbar's
@@ -2144,60 +2145,98 @@ window.__ModuleLoader__.load({
       document.head.appendChild(element);
     }
 
-    function apply(ctx) {
-      ensureStyle();
+    /**
+     * Register this panel as a DSH NATIVE right-sidebar tab. We no longer rely
+     * on dsh-better-sidebar's `betterSidebar` service (uninstalled): the host
+     * itself publishes `sidebarRightTabs` plus the `sidebar.right.pane.tab`
+     * slot, which is exactly the contract better-sidebar built on.
+     *
+     * A definition's `guide` entry feeds BOTH the native start page's capsule
+     * grid and the + / new-tab menu — the host opens a guide entry by calling
+     * `openTab(entry.kind)`, so no command registration is needed. Because more
+     * than one guide entry is now registered, the host keeps showing the guide
+     * (start) page as the default rather than auto-opening a single tab.
+     *
+     * Registering a tab TYPE does not open it; the panel appears only when the
+     * user picks its capsule/menu entry, leaving the native start page intact.
+     */
+    function registerNativeTab(ctx) {
+      // Unique implementation identity. Must not collide with any built-in id.
+      const DEFINITION_ID = 'dsh-multi-root-files';
+      const label = () => (isZh() ? COPY.zh.tab : COPY.en.tab);
+      const description = () => (isZh() ? COPY.zh.tabDesc : COPY.en.tabDesc);
 
-      // The tab service is published by dsh-better-sidebar, possibly AFTER this
-      // plugin's own activation: reconcile on the service event instead of
-      // requiring a mount order that belongs to another package.
-      let current = null;
-      const reconcile = () => {
-        const service = ctx.get('betterSidebar');
-        if (current?.service === service) return;
-        current?.dispose();
-        current = undefined;
-        if (service === undefined) return;
+      // The native body renders inside the HOST's React tree, so it cannot read
+      // this plugin's shell providers. Adapt the host's base-injected props
+      // (useTabInfo / useSessions / sessionId) into the {ctx, scope, visible}
+      // bag our panel already understands. useTabInfo/useSessions are hooks and
+      // are called unconditionally in a stable order; their presence is fixed
+      // for the lifetime of this component.
+      function NativeBody(props) {
+        const useTabInfo = props.useTabInfo;
+        const useSessions = props.useSessions;
+        const sessionId = props.sessionId;
+        const info = typeof useTabInfo === 'function' ? useTabInfo() : undefined;
+        const cwd = typeof useSessions === 'function'
+          ? useSessions((s) => (s && s.byId ? s.byId[sessionId]?.cwd : undefined))
+          : undefined;
+        const visible = info?.tab ? info.tab.visible !== false : true;
+        return h(MultiRootFilesTab, { ctx, scope: { sessionId, cwd }, visible });
+      }
+
+      // Wait for the tab-type REGISTRY service, not the slot declaration: the
+      // host declares `sidebar.right.pane.tab` before providing
+      // `sidebarRightTabs`, so a declaration-triggered registration would see
+      // the service missing and register nothing, permanently. ctx.inject
+      // re-runs whenever the service appears/reappears.
+      return ctx.inject(['sidebarRightTabs'], (injected) => {
+        const tabs = injected.get('sidebarRightTabs');
+        if (tabs === undefined || typeof tabs.register !== 'function') return;
+        const disposers = [];
         try {
-          current = {
-            service,
-            dispose: service.registerTab({
-              id: TAB_ID,
-              title: () => (isZh() ? COPY.zh.tab : COPY.en.tab),
-              description: () => (isZh() ? COPY.zh.tabDesc : COPY.en.tabDesc),
-              icon: (size) => h(MultiRootFilesIcon, { size }),
+          disposers.push(tabs.register({
+            id: DEFINITION_ID,
+            kind: TAB_ID,
+            multiple: false,
+            keepMounted: true,
+            priority: 'extension',
+            title: () => label(),
+            guide: [{
+              id: 'multi-root-files.main',
               order: 26,
-              single: true,
-              component: (props) => h(MultiRootFilesTab, props)
-            })
-          };
+              title: () => label(),
+              description: () => description(),
+              icon: (p) => h(MultiRootFilesIcon, { size: p?.size ?? 14 })
+            }]
+          }));
+          disposers.push(ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+            name: 'sidebar.right.pane.tab',
+            key: DEFINITION_ID
+          }, NativeBody)));
         } catch (error) {
-          // A duplicate registration (a reload that did not dispose) must not
-          // take the whole plugin tree down.
-          console.error('[dsh-multi-root-files] tab registration failed:', error);
-          current = undefined;
+          for (const dispose of disposers) {
+            try { dispose?.(); } catch { /* already gone */ }
+          }
+          console.error('[dsh-multi-root-files] native tab registration failed:', error);
           return;
         }
-        // Registering a tab TYPE does not open it: the page only appears once
-        // the layout holds it. We deliberately do NOT auto-open on activation.
-        // Opening here would occupy the right column on every boot and push the
-        // start page (guide) out of the layout — the user reported exactly that:
-        // before these tabs were added the native start page always showed.
-        // The tab stays registered and is opened on demand from the + menu or
-        // the start-page card, like every other extension tab.
-      };
-
-      ctx.effect(() => {
-        reconcile();
-        const offService = ctx.on('internal/service', (name) => {
-          if (name === 'betterSidebar') reconcile();
-        });
         return () => {
-          offService?.();
-          current?.dispose();
-          current = undefined;
+          for (const dispose of disposers) {
+            try { dispose?.(); } catch { /* already gone */ }
+          }
+        };
+      });
+    }
+
+    function apply(ctx) {
+      ensureStyle();
+      ctx.effect(() => {
+        const off = registerNativeTab(ctx);
+        return () => {
+          off?.();
           document.getElementById(STYLE_ID)?.remove();
         };
-      }, 'multi-root-files: sidebar tab');
+      }, 'multi-root-files: native sidebar tab');
     }
 
     const module = { exports: { apply, name: 'dsh-multi-root-files' } };

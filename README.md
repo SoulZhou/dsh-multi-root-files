@@ -6,7 +6,7 @@
 
 DSH 自带的「文件」面板只从会话主目录向下扫描，附加根里的代码在面板里根本看不见。
 这个插件补上那一层：根列表由宿主侧路由从多根登记表读出，目录内容与文件内容都走本插件
-**自有的** `/fs.trees`、`/fs.read` 宿主路由——不依赖上游 multi-root-workspace 对 better-sidebar
+**自有的** `/fs.trees`、`/fs.read` 宿主路由——不依赖上游 multi-root-workspace 对侧栏
 工作区围栏的移除。上游插件升级跟不上 DSH 而加载失败时，本面板照常用。
 
 ![多根文件树](screenshots/panel.png)
@@ -81,7 +81,7 @@ Agent 能读写它们，**但你仍然只能在面板里看到主目录的文件
 | 文件 | 作用 |
 | --- | --- |
 | `index.js` | 宿主侧：注册 `POST /dsh-multi-root-files/api/roots`（主目录 + 附加根）、`/fs.trees`（目录列表）、`/fs.read`（文件内容）等自有路由 |
-| `client.js` | 浏览器侧：通过 `ctx.get('betterSidebar').registerTab` 注册「多根文件」标签 |
+| `client.js` | 浏览器侧：通过 DSH 原生 `ctx.sidebarRightTabs.register` + `sidebar.right.pane.tab` 槽位注册「多根文件」标签与开始页卡片 |
 | `cordis.patch.yml` | bundle patch，插入插件自身一行 |
 
 宿主侧另有几个只读路由：`/fs.trees`（目录列表）、`/fs.read`（文件内容，含 UTF-8/UTF-16/GBK/GB18030
@@ -109,7 +109,7 @@ Agent 能读写它们，**但你仍然只能在面板里看到主目录的文件
 
 ## 依赖
 
-- `dsh-better-sidebar`（服务名 `betterSidebar`，需要 `registerTab` / `openFile` / `hostRouteUrl`）
+- DSH 自带的原生右侧栏（`ctx.sidebarRightTabs` 服务 + `sidebar.right.pane.tab` 槽位）——**不再依赖 dsh-better-sidebar**
 - 可选：`@dsh-electron/dsh-plugin-multi-root-workspace`（只负责**登记**附加根；不装也能用，
   只是只剩主目录）。目录列表与文件读取**不再依赖**它，因此它因 DSH 升级加载失败时本面板照常工作。
 
