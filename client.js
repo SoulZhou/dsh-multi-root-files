@@ -2184,13 +2184,20 @@ window.__ModuleLoader__.load({
         return h(MultiRootFilesTab, { ctx, scope: { sessionId, cwd }, visible });
       }
 
-      // Wait for the tab-type REGISTRY service, not the slot declaration: the
-      // host declares `sidebar.right.pane.tab` before providing
-      // `sidebarRightTabs`, so a declaration-triggered registration would see
-      // the service missing and register nothing, permanently. ctx.inject
-      // re-runs whenever the service appears/reappears.
-      return ctx.inject(['sidebarRightTabs'], (injected) => {
-        const tabs = injected.get('sidebarRightTabs');
+      // Register against the tab-type REGISTRY service. `sidebarRightTabs` is
+      // provided by @deepseek-ai/dsh-client-ui-sidebar-right, which may activate
+      // AFTER this plugin (inject ordering is a hint, not a guarantee), so we try
+      // immediately AND retry whenever a relevant service appears. The
+      // `registration` guard keeps this idempotent — a second attempt never
+      // double-registers the same id. This mirrors the get+on('internal/service')
+      // retry that this plugin used successfully with the old betterSidebar
+      // service, plus the reactive ctx.inject path better-sidebar itself uses.
+      let registration = null;
+      let stopped = false;
+
+      function doRegister() {
+        if (stopped || registration) return;
+        const tabs = typeof ctx.get === 'function' ? ctx.get('sidebarRightTabs') : undefined;
         if (tabs === undefined || typeof tabs.register !== 'function') return;
         const disposers = [];
         try {
@@ -2220,12 +2227,31 @@ window.__ModuleLoader__.load({
           console.error('[dsh-multi-root-files] native tab registration failed:', error);
           return;
         }
-        return () => {
+        registration = () => {
           for (const dispose of disposers) {
             try { dispose?.(); } catch { /* already gone */ }
           }
         };
-      });
+      }
+
+      // Immediate attempt (works when sidebar-right already activated).
+      doRegister();
+      // Retry when the registry/slot services appear later.
+      const offService = typeof ctx.on === 'function'
+        ? ctx.on('internal/service', (name) => {
+            if (name === 'sidebarRightTabs' || name === 'sidebarRight' || name === 'slots') doRegister();
+          })
+        : () => {};
+      const offInject = typeof ctx.inject === 'function'
+        ? ctx.inject(['sidebarRightTabs'], () => doRegister())
+        : () => {};
+
+      return () => {
+        stopped = true;
+        try { offService?.(); } catch { /* already gone */ }
+        try { offInject?.(); } catch { /* already gone */ }
+        registration?.();
+      };
     }
 
     function apply(ctx) {
@@ -2239,7 +2265,15 @@ window.__ModuleLoader__.load({
       }, 'multi-root-files: native sidebar tab');
     }
 
-    const module = { exports: { apply, name: 'dsh-multi-root-files' } };
+    const module = {
+      exports: {
+        apply,
+        name: 'dsh-multi-root-files',
+        // Cordis service dependencies: our apply() must not run before the slot
+        // system and session store exist (same declaration better-sidebar uses).
+        inject: ['slots', 'sessions', 'locale']
+      }
+    };
     module.exports.__test = { isUnder, baseName, normalizeLevel };
     return module.exports;
   }
