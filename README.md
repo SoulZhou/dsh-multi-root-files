@@ -5,8 +5,9 @@
 **右键任何行**还能复制绝对路径、在系统文件管理器里打开。
 
 DSH 自带的「文件」面板只从会话主目录向下扫描，附加根里的代码在面板里根本看不见。
-这个插件补上那一层：根列表由宿主侧路由从多根登记表读出，目录内容仍走 better-sidebar
-现成的 `fs.trees` 路由（工作区围栏已移除，绝对路径在 cwd 之外也能列）。
+这个插件补上那一层：根列表由宿主侧路由从多根登记表读出，目录内容与文件内容都走本插件
+**自有的** `/fs.trees`、`/fs.read` 宿主路由——不依赖上游 multi-root-workspace 对 better-sidebar
+工作区围栏的移除。上游插件升级跟不上 DSH 而加载失败时，本面板照常用。
 
 ![多根文件树](screenshots/panel.png)
 
@@ -31,7 +32,7 @@ Agent 能读写它们，**但你仍然只能在面板里看到主目录的文件
 
 - **根列表**：工具栏的下拉框列出全部根——主目录排第一（标记「主目录」），附加根按登记顺序
   跟上（标记「附加」）。选中哪个根，树就显示哪个根。
-- **目录懒加载**：展开目录时按批请求 `fs.trees`（每次 ≤64 个路径），单层失败只在该层显示
+- **目录懒加载**：展开目录时按批请求本插件的 `/fs.trees`（每次 ≤64 个路径），单层失败只在该层显示
   「这个目录读取失败」，不会让整个面板报错。
 - **左右分栏**：点文件时，树在左、文件内容在右并排显示（不是上下堆叠），
   这样在侧栏这种窄列里文件树仍然可读。
@@ -79,11 +80,12 @@ Agent 能读写它们，**但你仍然只能在面板里看到主目录的文件
 
 | 文件 | 作用 |
 | --- | --- |
-| `index.js` | 宿主侧：注册 `POST /dsh-multi-root-files/api/roots`，返回主目录 + 附加根（含 `exists`）|
+| `index.js` | 宿主侧：注册 `POST /dsh-multi-root-files/api/roots`（主目录 + 附加根）、`/fs.trees`（目录列表）、`/fs.read`（文件内容）等自有路由 |
 | `client.js` | 浏览器侧：通过 `ctx.get('betterSidebar').registerTab` 注册「多根文件」标签 |
 | `cordis.patch.yml` | bundle patch，插入插件自身一行 |
 
-宿主侧另有几个只读路由：`/status`（Git 状态标记）、`/image`（图片预览）、`/diff`（改动行号）、
+宿主侧另有几个只读路由：`/fs.trees`（目录列表）、`/fs.read`（文件内容，含 UTF-8/UTF-16/GBK/GB18030
+编码嗅探）、`/status`（Git 状态标记）、`/image`（图片预览）、`/diff`（改动行号）、
 `/open`（在系统文件管理器里打开一个路径），以及 `/settings`（GET 读 / POST 写本面板的字体大小
 设置，落盘到插件自有文件）。
 
@@ -91,7 +93,7 @@ Agent 能读写它们，**但你仍然只能在面板里看到主目录的文件
 
 **只读**。这个插件从不写入、重命名或删除任何文件：
 
-- 目录列表走 better-sidebar 现成的 `fs.trees` 路由，宿主侧不直接读盘。
+- 目录列表走本插件自有的 `fs.trees` 路由（宿主侧只读目录项，不写入）。
 - 打开文件是侧栏编辑器自己的职责（仍在右侧栏内）。
 - `/status` 只跑 `git status` 与 `git check-ignore`；`/diff` 只跑 `git diff --unified=0`。
 - `/image` 只读一个图片文件的字节，超过 12 MiB 直接拒绝。
@@ -108,8 +110,8 @@ Agent 能读写它们，**但你仍然只能在面板里看到主目录的文件
 ## 依赖
 
 - `dsh-better-sidebar`（服务名 `betterSidebar`，需要 `registerTab` / `openFile` / `hostRouteUrl`）
-- 可选：`@dsh-electron/dsh-plugin-multi-root-workspace`（提供附加根登记；不装也能用，只是
-  只剩主目录）
+- 可选：`@dsh-electron/dsh-plugin-multi-root-workspace`（只负责**登记**附加根；不装也能用，
+  只是只剩主目录）。目录列表与文件读取**不再依赖**它，因此它因 DSH 升级加载失败时本面板照常工作。
 
 ## 安装
 

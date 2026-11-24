@@ -7,9 +7,10 @@
  *
  * The page shows ONE root at a time: the session's primary root by default, any
  * root registered through multi-root-workspace picked from the toolbar's
- * dropdown. Levels load lazily through the sidebar's own `fs.trees` route (the
- * workspace fence is gone, so an absolute path outside the session cwd lists
- * fine). Clicking a file reads it through `fs.read` and renders it in a preview
+ * dropdown. Levels load lazily through this plugin's own `/fs.trees` route (no
+ * workspace fence, so an absolute path outside the session cwd lists fine even
+ * when the upstream multi-root plugin is down). Clicking a file reads it through
+ * our own `/fs.read` and renders it in a preview
  * pane BESIDE the tree, inside this tab — the same in-tab split the
  * multi-root-changes tab uses, so no new window, no extra sidebar tab, and no
  * external app is involved. Right-clicking a row (or the preview title) offers
@@ -244,14 +245,14 @@ window.__ModuleLoader__.load({
       });
     }
 
-    /** One batch of directory levels through the sidebar's own fs route. */
+    /** One batch of directory levels through this plugin's own fs route. */
     async function fetchLevels(ctx, scope, paths) {
       const payload = { paths };
       if (scope?.sessionId) payload.sessionId = scope.sessionId;
       if (scope?.cwd) payload.cwd = scope.cwd;
       let response;
       try {
-        response = await fetch(routeUrl(ctx, 'sidebar/api/fs.trees'), {
+        response = await fetch(routeUrl(ctx, `${API_BASE}/fs.trees`), {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(payload)
@@ -267,11 +268,6 @@ window.__ModuleLoader__.load({
       return Array.isArray(parsed?.value?.levels) ? parsed.value.levels : [];
     }
 
-    /**
-     * One file's bytes for the in-tab preview, through the sidebar's own read
-     * route: `{ kind: 'text', content }`, or the `binary` / `too-large`
-     * verdicts the editor host also answers with.
-     */
     /**
      * Git decorations for the visible rows. The host runs `git status` per root
      * (dsh-better-sidebar's own `git.status` is pinned to the session cwd and
@@ -351,7 +347,7 @@ window.__ModuleLoader__.load({
       if (scope?.cwd) payload.cwd = scope.cwd;
       let response;
       try {
-        response = await fetch(routeUrl(ctx, 'sidebar/api/fs.read'), {
+        response = await fetch(routeUrl(ctx, `${API_BASE}/fs.read`), {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(payload)

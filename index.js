@@ -11,8 +11,11 @@
  * "which roots does this session have?" The answer comes from the multi-root
  * plugin's own durable store ($DSH_HOME/storages/multi_root_workspace.json),
  * keyed by the PRIMARY root's absolute path. The client then lists and reads
- * those roots through dsh-better-sidebar's existing /sidebar fs routes, whose
- * containment fence is gone, so an absolute path outside cwd resolves fine.
+ * those roots through THIS plugin's own /fs.trees and /fs.read routes. They
+ * deliberately do not go through dsh-better-sidebar's ensureWorkspacePath()
+ * fence (which @dsh-electron/dsh-plugin-multi-root-workspace patches away only
+ * while it loads): an absolute path outside cwd resolves fine even when that
+ * upstream plugin failed to load after a DSH upgrade.
  *
  * Read-only over the workspace: this plugin never writes, renames or deletes
  * anything. Opening a file is the sidebar editor's job (still inside the right
@@ -22,9 +25,9 @@
  * arguments, and can only point at a real file or folder.
  */
 import { execFile } from 'node:child_process';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, extname, join, resolve, relative } from 'node:path';
+import { dirname, extname, join, resolve, relative, sep } from 'node:path';
 
 const API = '/dsh-multi-root-files/api';
 
@@ -45,6 +48,14 @@ const MAX_IGNORE_PATHS = 4096;
 const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
 /** The file manager gets a shorter leash than git: it should answer at once. */
 const OPEN_TIMEOUT_MS = 6000;
+/** Max directory rows in one fs.trees level (mirrors the sidebar explorer's cap). */
+const LIST_LIMIT = 1000;
+/** Max paths accepted in one fs.trees batch (the client batches by 64). */
+const MAX_TREE_PATHS = 64;
+/** Text files bigger than this are served as a short `too-large` head. */
+const MAX_EDITABLE_BYTES = 5 * 1024 * 1024;
+/** Bytes read from an oversized file, enough to sniff its encoding. */
+const READ_HEAD_LIMIT = 4096;
 
 /** Image types the preview can draw, by extension. */
 const IMAGE_TYPES = {
@@ -229,6 +240,245 @@ async function rootExists(path) {
     return (await stat(path)).isDirectory();
   } catch {
     return false;
+  }
+}
+
+/* ------------------------------------------------ own fs list / read routes */
+
+/*
+ * These two routes replace dsh-better-sidebar's `fs.trees` / `fs.read` for this
+ * panel. The sidebar versions call ensureWorkspacePath(), a containment fence
+ * that only lets paths inside the session cwd through; it is the UPSTREAM
+ * multi-root plugin's patch that removes that fence, so when that plugin fails
+ * to load after a DSH upgrade the tree dies. Our own host routes read absolute
+ * paths directly (exactly like this plugin's existing /image and /open routes
+ * already do), which removes that hard dependency entirely.
+ *
+ * Wire shapes are byte-compatible with the sidebar so the client only has to
+ * change the route path, not the renderer.
+ */
+
+function messageOf(error) {
+  return String(error?.message ?? error);
+}
+
+/** Compare two byte prefixes. */
+function startsWith(bytes, prefix) {
+  if (bytes.length < prefix.length) return false;
+  for (let i = 0; i < prefix.length; i += 1) if (bytes[i] !== prefix[i]) return false;
+  return true;
+}
+
+const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
+const UTF16LE_BOM = Buffer.from([0xff, 0xfe]);
+const UTF16BE_BOM = Buffer.from([0xfe, 0xff]);
+const UTF32LE_BOM = Buffer.from([0xff, 0xfe, 0x00, 0x00]);
+const UTF32BE_BOM = Buffer.from([0x00, 0x00, 0xfe, 0xff]);
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
+const GBK_DECODER = new TextDecoder('gbk', { fatal: true });
+const GB18030_DECODER = new TextDecoder('gb18030', { fatal: true });
+
+function decodeUtf16(bytes, littleEndian) {
+  const length = bytes.length - (bytes.length % 2);
+  const body = Buffer.from(bytes.subarray(0, length));
+  if (!littleEndian) body.swap16();
+  return body.toString('utf16le');
+}
+
+function decodeUtf32(bytes, littleEndian) {
+  const length = bytes.length - (bytes.length % 4);
+  let content = '';
+  for (let offset = 0; offset < length; offset += 4) {
+    const codePoint = littleEndian ? bytes.readUInt32LE(offset) : bytes.readUInt32BE(offset);
+    content += codePoint <= 0x10ffff && !(codePoint >= 0xd800 && codePoint <= 0xdfff)
+      ? String.fromCodePoint(codePoint)
+      : '\ufffd';
+  }
+  return content;
+}
+
+function isUtf16TextUnit(unit) {
+  if (unit === 9 || unit === 10 || unit === 13) return true;
+  if (unit >= 32 && unit <= 126) return true;
+  if (unit >= 160 && unit <= 55295) return true;
+  return unit >= 57344 && unit <= 65533;
+}
+
+function looksLikeUtf16Text(bytes, pairs, littleEndian) {
+  if (pairs === 0) return false;
+  let text = 0;
+  for (let index = 0; index < pairs; index += 1) {
+    const unit = littleEndian
+      ? bytes[index * 2] | (bytes[index * 2 + 1] << 8)
+      : (bytes[index * 2] << 8) | bytes[index * 2 + 1];
+    if (isUtf16TextUnit(unit)) text += 1;
+  }
+  return text * 10 >= pairs * 9;
+}
+
+/** Detect BOM-less UTF-16 from the NUL-byte lane, guarded by a text-lane vote. */
+function bomlessUtf16(bytes) {
+  if (bytes.length < 4) return undefined;
+  const pairs = Math.min(Math.floor(bytes.length / 2), 1024);
+  let evenZeros = 0;
+  let oddZeros = 0;
+  for (let i = 0; i < pairs; i += 1) {
+    if (bytes[i * 2] === 0) evenZeros += 1;
+    if (bytes[i * 2 + 1] === 0) oddZeros += 1;
+  }
+  const minimumZeros = Math.max(2, Math.floor(pairs * 0.2));
+  if (oddZeros >= minimumZeros && oddZeros >= evenZeros * 4 && looksLikeUtf16Text(bytes, pairs, true)) return 'utf16le';
+  if (evenZeros >= minimumZeros && evenZeros >= oddZeros * 4 && looksLikeUtf16Text(bytes, pairs, false)) return 'utf16be';
+  return undefined;
+}
+
+function tryDecode(decoder, bytes) {
+  try { return decoder.decode(bytes); } catch { return undefined; }
+}
+
+function hasGb18030FourByteSequence(bytes) {
+  for (let i = 0; i + 3 < bytes.length; i += 1) {
+    const b1 = bytes[i]; const b2 = bytes[i + 1]; const b3 = bytes[i + 2]; const b4 = bytes[i + 3];
+    if (b1 >= 129 && b1 <= 254 && b2 >= 48 && b2 <= 57 && b3 >= 129 && b3 <= 254 && b4 >= 48 && b4 <= 57) return true;
+  }
+  return false;
+}
+
+function hasIncompleteUtf8Tail(bytes) {
+  for (let start = Math.max(0, bytes.length - 3); start < bytes.length; start += 1) {
+    const lead = bytes[start];
+    const size = lead >= 240 && lead <= 244 ? 4 : lead >= 224 && lead <= 239 ? 3 : lead >= 194 && lead <= 223 ? 2 : 0;
+    if (size === 0 || start + size <= bytes.length) continue;
+    let incomplete = true;
+    for (let i = start + 1; i < bytes.length; i += 1) {
+      const trail = bytes[i];
+      if (trail < 128 || trail > 191) { incomplete = false; break; }
+    }
+    if (incomplete && tryDecode(UTF8_DECODER, bytes.subarray(0, start)) !== undefined) return true;
+  }
+  return false;
+}
+
+/** Decode a text buffer, or `null` when it looks binary. */
+function decodeTextBytes(bytes, truncated = false) {
+  if (startsWith(bytes, UTF32LE_BOM)) return { content: decodeUtf32(bytes.subarray(4), true) };
+  if (startsWith(bytes, UTF32BE_BOM)) return { content: decodeUtf32(bytes.subarray(4), false) };
+  if (startsWith(bytes, UTF8_BOM)) return { content: bytes.subarray(3).toString('utf8') };
+  if (startsWith(bytes, UTF16LE_BOM)) return { content: decodeUtf16(bytes.subarray(2), true) };
+  if (startsWith(bytes, UTF16BE_BOM)) return { content: decodeUtf16(bytes.subarray(2), false) };
+  const utf16 = bomlessUtf16(bytes);
+  if (utf16 !== undefined) return { content: decodeUtf16(bytes, utf16 === 'utf16le') };
+  if (bytes.includes(0)) return null;
+  const utf8 = tryDecode(UTF8_DECODER, bytes);
+  if (utf8 !== undefined) return { content: utf8 };
+  if (truncated && hasIncompleteUtf8Tail(bytes)) return { content: bytes.toString('utf8') };
+  const gb18030 = tryDecode(GB18030_DECODER, bytes);
+  if (gb18030 !== undefined && hasGb18030FourByteSequence(bytes)) return { content: gb18030 };
+  const gbk = tryDecode(GBK_DECODER, bytes);
+  if (gbk !== undefined) return { content: gbk };
+  if (gb18030 !== undefined) return { content: gb18030 };
+  return { content: bytes.toString('utf8') };
+}
+
+/** Directory-first, case-insensitive name ordering (mirrors the sidebar). */
+function compareEntries(a, b) {
+  if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+  const la = a.name.toLowerCase();
+  const lb = b.name.toLowerCase();
+  if (la !== lb) return la < lb ? -1 : 1;
+  if (a.name === b.name) return 0;
+  return a.name < b.name ? -1 : 1;
+}
+
+/** Read one directory level; wire shape matches the sidebar's listDirectory(). */
+async function listDirectory(path) {
+  const dirents = await readdir(path, { withFileTypes: true });
+  const prefix = path.endsWith(sep) ? path : `${path}${sep}`;
+  const truncated = dirents.length > LIST_LIMIT;
+  const kept = truncated ? dirents.slice(0, LIST_LIMIT) : dirents;
+  const rows = new Array(kept.length);
+  for (let index = 0; index < kept.length; index += 1) {
+    const dirent = kept[index];
+    rows[index] = {
+      name: dirent.name,
+      path: `${prefix}${dirent.name}`,
+      isDir: dirent.isDirectory(),
+      isSymlink: dirent.isSymbolicLink(),
+      broken: false,
+      hidden: dirent.name.startsWith('.')
+    };
+  }
+  rows.sort(compareEntries);
+  return { path, entries: rows, truncated };
+}
+
+/** The generic RPC envelope the sidebar's call() wrapper produces. */
+function rpcOk(value) { return { ok: true, value }; }
+function rpcError(message) { return { ok: false, error: { message: String(message) } }; }
+
+/** POST /fs.trees: batch of directory levels. body {paths:[abs]} → {levels:[...]}. */
+async function handleFsTrees(ctx, request, response) {
+  const body = await readJsonBody(request);
+  const paths = Array.isArray(body?.paths)
+    ? body.paths.filter((value) => typeof value === 'string' && value !== '')
+    : [];
+  if (paths.length === 0) { sendJson(response, 200, rpcError('paths must be a non-empty array')); return; }
+  const levels = await Promise.all(paths.slice(0, MAX_TREE_PATHS).map(async (raw) => {
+    try {
+      return await listDirectory(resolve(raw));
+    } catch (error) {
+      return { path: raw, entries: [], truncated: false, error: messageOf(error) };
+    }
+  }));
+  sendJson(response, 200, rpcOk({ levels }));
+}
+
+/** POST /fs.read: one text file. body {path:abs} → {kind, content|head, size, mtimeMs}. */
+async function handleFsRead(ctx, request, response) {
+  const body = await readJsonBody(request);
+  const path = typeof body?.path === 'string' ? body.path : '';
+  let info;
+  try {
+    info = await stat(path);
+  } catch (error) {
+    sendJson(response, 200, rpcError(messageOf(error)));
+    return;
+  }
+  if (info.isDirectory()) {
+    sendJson(response, 200, rpcError(`"${path}" is a directory`));
+    return;
+  }
+  const size = info.size;
+  const oversized = size > MAX_EDITABLE_BYTES;
+  let handle;
+  try {
+    handle = await open(path, 'r');
+  } catch (error) {
+    sendJson(response, 200, rpcError(messageOf(error)));
+    return;
+  }
+  try {
+    const window = oversized ? READ_HEAD_LIMIT : size;
+    const buffer = Buffer.alloc(window);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const slice = buffer.subarray(0, bytesRead);
+    const decoded = decodeTextBytes(slice, oversized);
+    if (decoded === null) {
+      sendJson(response, 200, rpcOk({
+        kind: 'binary', size, mtimeMs: info.mtimeMs,
+        head: slice.subarray(0, Math.min(slice.length, READ_HEAD_LIMIT)).toString('base64')
+      }));
+      return;
+    }
+    if (oversized) {
+      sendJson(response, 200, rpcOk({
+        kind: 'too-large', size, mtimeMs: info.mtimeMs, head: slice.toString('base64')
+      }));
+      return;
+    }
+    sendJson(response, 200, rpcOk({ kind: 'text', content: decoded.content, size, mtimeMs: info.mtimeMs }));
+  } finally {
+    await handle.close();
   }
 }
 
@@ -779,6 +1029,8 @@ export function apply(ctx) {
     host.effect(() => {
       const disposers = [
         registerPost(host, 'roots', handleRoots),
+        registerPost(host, 'fs.trees', handleFsTrees),
+        registerPost(host, 'fs.read', handleFsRead),
         registerPost(host, 'status', handleStatus),
         registerPost(host, 'image', handleImage),
         registerPost(host, 'diff', handleDiff),
@@ -796,5 +1048,6 @@ export function apply(ctx) {
 
 export const __test = {
   pathIdentity, baseName, readAdditionalRoots, statusOfXY, splitNul, parseUnifiedHunks, imageTypeFor,
+  decodeTextBytes, compareEntries, listDirectory,
   sanitizeSettings, handleSettings, settingsPath, FONT_SCALE_MIN, FONT_SCALE_MAX, DEFAULT_SETTINGS
 };
