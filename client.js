@@ -2178,32 +2178,12 @@ window.__ModuleLoader__.load({
           return;
         }
         // Registering a tab TYPE does not open it: the page only appears once
-        // the layout holds it, and a restart can reset that layout.
-        //
-        // The open must go through DSH's OWN right column (`sidebarRight`):
-        // better-sidebar's `openTab` lands in the plugin's bottom workbench,
-        // which is off screen — the page has to be in the right dock where the
-        // reader works.
-        const openIfMissing = () => {
-          try {
-            const right = ctx.get?.('sidebarRight');
-            if (right === undefined || typeof right.openTab !== 'function') return false;
-            right.openTab(TAB_ID, { params: {} });
-            return true;
-          } catch (error) {
-            console.warn('[dsh-multi-root-files] could not open the tab:', error);
-            return true;
-          }
-        };
-        const done = openIfMissing();
-        if (!done) {
-          // The host publishes the column service a moment after the plugin
-          // activates; retry on that event instead of opening blind.
-          const off = ctx.on?.('internal/service', (name) => {
-            if (name === 'sidebarRight') openIfMissing();
-          });
-          current.extraDispose = () => { try { off?.(); } catch { /* gone */ } };
-        }
+        // the layout holds it. We deliberately do NOT auto-open on activation.
+        // Opening here would occupy the right column on every boot and push the
+        // start page (guide) out of the layout — the user reported exactly that:
+        // before these tabs were added the native start page always showed.
+        // The tab stays registered and is opened on demand from the + menu or
+        // the start-page card, like every other extension tab.
       };
 
       ctx.effect(() => {
@@ -2213,7 +2193,6 @@ window.__ModuleLoader__.load({
         });
         return () => {
           offService?.();
-          current?.extraDispose?.();
           current?.dispose();
           current = undefined;
           document.getElementById(STYLE_ID)?.remove();
