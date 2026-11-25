@@ -124,6 +124,8 @@ window.__ModuleLoader__.load({
         editorConflict: '文件在磁盘上已被改动，未覆盖。取消后可重新打开再改。',
         editorReadOnlyEncoding: '这个文件的编码（{encoding}）无法安全写回，只能查看。',
         editorUnchanged: '没有修改，无需保存',
+        fileGone: '这个文件已不在磁盘上（被删除或改名了），文件列表已刷新。',
+        fileUnreadable: '这个文件读不到了：{detail}',
         imageZoomIn: '放大图片',
         imageZoomOut: '缩小图片',
         imageZoomReset: '恢复适应窗口（双击百分比）',
@@ -187,6 +189,8 @@ window.__ModuleLoader__.load({
         editorConflict: 'The file changed on disk; nothing was overwritten. Cancel, reopen it, and edit again.',
         editorReadOnlyEncoding: 'This file is {encoding}; saving it here would change its encoding, so it is read-only.',
         editorUnchanged: 'Nothing changed — no need to save',
+        fileGone: 'That file is no longer on disk (deleted or renamed). The file list has been refreshed.',
+        fileUnreadable: 'Could not reach that file: {detail}',
         imageZoomIn: 'Zoom in',
         imageZoomOut: 'Zoom out',
         imageZoomReset: 'Fit to window (double-click the percentage)',
@@ -385,7 +389,9 @@ window.__ModuleLoader__.load({
       let parsed = null;
       try { parsed = await response.json(); } catch { /* keep the status below */ }
       if (!response.ok || parsed?.ok !== true) {
-        throw new Error(parsed?.error?.message ?? `HTTP ${response.status}`);
+        const failure = new Error(parsed?.error?.message ?? `HTTP ${response.status}`);
+        failure.code = typeof parsed?.error?.code === 'string' ? parsed.error.code : undefined;
+        throw failure;
       }
       return parsed?.value ?? null;
     }
@@ -414,11 +420,23 @@ window.__ModuleLoader__.load({
       if (!response.ok || parsed?.ok !== true) {
         const message = parsed?.error?.message ?? `HTTP ${response.status}`;
         const failure = new Error(message);
+        failure.code = typeof parsed?.error?.code === 'string' ? parsed.error.code : undefined;
         failure.conflict = /changed on disk/i.test(message);
         failure.readOnlyEncoding = /encoding/i.test(message);
         throw failure;
       }
       return parsed?.value ?? null;
+    }
+
+    /**
+     * One host failure as one line a person can act on. A missing file is the
+     * common case (the tree outlived the file: it was deleted or renamed after
+     * the listing), and echoing Node's own "ENOENT: no such file or directory,
+     * stat 'F:\\...'" into the panel banner only ever confused the reader.
+     */
+    function errorCopy(t, error) {
+      if (error?.code === 'ENOENT') return t('fileGone');
+      return error instanceof Error ? error.message : String(error);
     }
 
     /**
@@ -1201,11 +1219,11 @@ window.__ModuleLoader__.load({
           setBaseline(draft);
           setEditing(false);
         } catch (error) {
-          setSaveError(error instanceof Error ? error.message : String(error));
+          setSaveError(errorCopy(t, error));
         } finally {
           setSaving(false);
         }
-      }, [onSave, preview.path, draft, baseline, dirty, value]);
+      }, [onSave, preview.path, draft, baseline, dirty, value, t]);
 
       // Ctrl/Cmd+S saves; Esc leaves the editor unless a save is in flight.
       const onEditorKeyDown = useCallback((event) => {
@@ -1891,14 +1909,17 @@ window.__ModuleLoader__.load({
           setPreview({ path: entry.path, name: entry.name, phase: 'ready', value, image, diff });
         } catch (error) {
           if (gen !== previewGeneration.current) return;
+          // A row the tree still lists but the disk no longer has: drop the
+          // stale listing so the next attempt is not doomed the same way.
+          if (error?.code === 'ENOENT') void load();
           setPreview({
             path: entry.path,
             name: entry.name,
             phase: 'error',
-            error: error instanceof Error ? error.message : String(error)
+            error: errorCopy(t, error)
           });
         }
-      }, []);
+      }, [load, t]);
 
       const closePreview = useCallback(() => {
         previewGeneration.current += 1;
@@ -1911,7 +1932,16 @@ window.__ModuleLoader__.load({
        * match the new bytes) and the diff of the file being previewed.
        */
       const savePreview = useCallback(async (path, content, mtimeMs) => {
-        const saved = await saveFile(ctxRef.current, path, content, mtimeMs);
+        let saved;
+        try {
+          saved = await saveFile(ctxRef.current, path, content, mtimeMs);
+        } catch (error) {
+          // The tree is a snapshot: a file deleted after it was read is still
+          // listed, and the save is the first thing to notice. Re-read the
+          // tree so the stale row disappears instead of failing again.
+          if (error?.code === 'ENOENT') void load();
+          throw error;
+        }
         setPreview((current) => {
           if (current === null || pathKey(current.path) !== pathKey(path)) return current;
           const value = current.value ?? {};
@@ -1935,7 +1965,7 @@ window.__ModuleLoader__.load({
         ));
         void refreshDecoration();
         return saved;
-      }, [refreshDecoration]);
+      }, [refreshDecoration, load]);
 
       /* ------------------------------------------- context menu and toast */
 

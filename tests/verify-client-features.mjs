@@ -144,5 +144,13 @@ check('host refuses a stale mtime', /changed on disk since you opened it/.test(i
 check('host never rewrites other encodings', /WRITABLE_ENCODINGS/.test(indexSrc) && /would change its encoding/.test(indexSrc));
 check('host keeps the file line ending', /applyLineEnding\(content, detectLineEnding/.test(indexSrc));
 
+console.log('\n=== editor: a file that vanished after the tree was read ===');
+check('a vanished file is explained, not echoed as ENOENT', /function errorCopy\(t, error\) \{[\s\S]{0,120}?error\?\.code === 'ENOENT'\) return t\('fileGone'\)/.test(clientSrc));
+check('both locales explain the vanished file', (clientSrc.match(/fileGone:/g) ?? []).length === 2, `got ${(clientSrc.match(/fileGone:/g) ?? []).length}`);
+check('reading a vanished file refreshes the tree', /error\?\.code === 'ENOENT'\) void load\(\)/.test(clientSrc));
+check('saving a vanished file refreshes the tree', /else if \(error\?\.code === 'ENOENT'\) void load\(\)|if \(error\?\.code === 'ENOENT'\) void load\(\)/.test(clientSrc));
+check('host reports the code with the message', /function rpcError\(message, code\)/.test(indexSrc) && /error\.code = code|error\.code = /.test(indexSrc));
+check('host words the disappearance itself', /is no longer on disk/.test(indexSrc));
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED\n' : `\n${failures} CHECK(S) FAILED\n`);
 process.exit(failures === 0 ? 0 : 1);

@@ -13,7 +13,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const dir = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const mod = await import(pathToFileURL(join(dir, 'index.js')).href);
 const {
-  handleFsWrite, decodeTextBytes, encodeText, detectLineEnding, applyLineEnding,
+  handleFsWrite, handleFsRead, decodeTextBytes, encodeText, detectLineEnding, applyLineEnding,
   WRITABLE_ENCODINGS, MAX_EDITABLE_BYTES
 } = mod.__test;
 
@@ -41,6 +41,18 @@ async function save(body) {
   const stream = Readable.from([Buffer.from(JSON.stringify(body), 'utf8')]);
   stream.method = 'POST';
   await handleFsWrite(null, stream, response);
+  const res = await done;
+  let json;
+  try { json = JSON.parse(res.text); } catch { /* not json */ }
+  return { status: res.statusCode, json, text: res.text };
+}
+
+/** Same envelope, through the read handler — it must explain ENOENT too. */
+async function read(path) {
+  const { response, done } = makeResponse();
+  const stream = Readable.from([Buffer.from(JSON.stringify({ path }), 'utf8')]);
+  stream.method = 'POST';
+  await handleFsRead(null, stream, response);
   const res = await done;
   let json;
   try { json = JSON.parse(res.text); } catch { /* not json */ }
@@ -111,6 +123,22 @@ try {
   const dirTarget = await save({ path: root, content: 'x' });
   check('directory target is refused', dirTarget.json?.ok === false && /is a directory/.test(dirTarget.json.error.message), dirTarget.text);
 
+  // A file deleted after the tree was read: the panel used to surface the raw
+  // "ENOENT: no such file or directory, stat 'F:\\...'" text in its banner.
+  const gonePath = join(root, 'gone.md');
+  const gone = await save({ path: gonePath, content: 'x' });
+  check('vanished file is refused', gone.json?.ok === false, gone.text);
+  check('vanished file gets a sentence, not a raw errno',
+    /no longer on disk/.test(gone.json?.error?.message ?? '') && !/ENOENT/.test(gone.json?.error?.message ?? ''),
+    gone.json?.error?.message);
+  check('vanished file carries the ENOENT code', gone.json?.error?.code === 'ENOENT', gone.json?.error?.code);
+  check('nothing was created in its place', (await stat(gonePath).catch(() => null)) === null);
+
+  const goneRead = await read(gonePath);
+  check('fs.read explains the vanished file too',
+    goneRead.json?.ok === false && /no longer on disk/.test(goneRead.json.error.message) && goneRead.json.error.code === 'ENOENT',
+    goneRead.text);
+
   const gbkPath = join(root, 'gbk.txt');
   await writeFile(gbkPath, Buffer.from([0xc4, 0xe3, 0xba, 0xc3]));
   const gbkSave = await save({ path: gbkPath, content: '你好呀' });
@@ -137,6 +165,8 @@ try {
   const { readFileSync } = await import('node:fs');
   const clientSrc = readFileSync(join(dir, 'client.js'), 'utf8');
   assertMatch(clientSrc, /saveFile\s*\(/, 'client has a saveFile helper');
+  assertMatch(clientSrc, /failure\.code = typeof parsed\?\.error\?\.code/, 'saveFile keeps the error code');
+  assertMatch(clientSrc, /error\?\.code === 'ENOENT'\) void load\(\)/, 'a vanished file refreshes the tree');
   assertMatch(clientSrc, /mrf-mdToggle/, 'toggle still present');
   assertMatch(clientSrc, /textContent|\.value\b/, 'editor uses a textarea/value');
 

@@ -484,7 +484,22 @@ async function listDirectory(path) {
 
 /** The generic RPC envelope the sidebar's call() wrapper produces. */
 function rpcOk(value) { return { ok: true, value }; }
-function rpcError(message) { return { ok: false, error: { message: String(message) } }; }
+/**
+ * `code` carries the syscall code (ENOENT, EACCES, EISDIR…) so the client can
+ * tell "this file is gone" from "this file is unreadable" and react to the
+ * first by refreshing a tree that still lists the file. The message stays
+ * human: a raw Node errno string in a panel banner helps nobody.
+ */
+function rpcError(message, code) {
+  const error = { message: String(message) };
+  if (code !== undefined && typeof code === 'string') error.code = code;
+  return { ok: false, error };
+}
+
+/** One sentence a person can act on, for the file-vanished case. */
+function missingFileMessage(path) {
+  return `"${path}" is no longer on disk (deleted or renamed after the tree was read)`;
+}
 
 /** POST /fs.trees: batch of directory levels. body {paths:[abs]} → {levels:[...]}. */
 async function handleFsTrees(ctx, request, response) {
@@ -511,11 +526,15 @@ async function handleFsRead(ctx, request, response) {
   try {
     info = await stat(path);
   } catch (error) {
-    sendJson(response, 200, rpcError(messageOf(error)));
+    const code = typeof error?.code === 'string' ? error.code : undefined;
+    sendJson(response, 200, rpcError(
+      code === 'ENOENT' ? missingFileMessage(path) : messageOf(error),
+      code
+    ));
     return;
   }
   if (info.isDirectory()) {
-    sendJson(response, 200, rpcError(`"${path}" is a directory`));
+    sendJson(response, 200, rpcError(`"${path}" is a directory`, 'EISDIR'));
     return;
   }
   const size = info.size;
@@ -524,7 +543,11 @@ async function handleFsRead(ctx, request, response) {
   try {
     handle = await open(path, 'r');
   } catch (error) {
-    sendJson(response, 200, rpcError(messageOf(error)));
+    const code = typeof error?.code === 'string' ? error.code : undefined;
+    sendJson(response, 200, rpcError(
+      code === 'ENOENT' ? missingFileMessage(path) : messageOf(error),
+      code
+    ));
     return;
   }
   try {
@@ -577,10 +600,17 @@ async function handleFsWrite(ctx, request, response) {
   try {
     info = await stat(path);
   } catch (error) {
-    sendJson(response, 200, rpcError(messageOf(error)));
+    // The tree this path came from may be older than the disk: report the
+    // disappearance in words (plus a code the client can branch on) rather
+    // than echoing "ENOENT: no such file or directory, stat 'F:\\...'".
+    const code = typeof error?.code === 'string' ? error.code : undefined;
+    sendJson(response, 200, rpcError(
+      code === 'ENOENT' ? missingFileMessage(path) : messageOf(error),
+      code
+    ));
     return;
   }
-  if (info.isDirectory()) { sendJson(response, 200, rpcError(`"${path}" is a directory`)); return; }
+  if (info.isDirectory()) { sendJson(response, 200, rpcError(`"${path}" is a directory`, 'EISDIR')); return; }
   if (info.size > MAX_EDITABLE_BYTES) {
     sendJson(response, 200, rpcError('file is too large to edit here'));
     return;
@@ -608,7 +638,11 @@ async function handleFsWrite(ctx, request, response) {
     }
     bytes = encodeText(applyLineEnding(content, detectLineEnding(decoded.content)), decoded.encoding);
   } catch (error) {
-    sendJson(response, 200, rpcError(messageOf(error)));
+    const code = typeof error?.code === 'string' ? error.code : undefined;
+    sendJson(response, 200, rpcError(
+      code === 'ENOENT' ? missingFileMessage(path) : messageOf(error),
+      code
+    ));
     return;
   }
 
@@ -617,7 +651,11 @@ async function handleFsWrite(ctx, request, response) {
     const after = await stat(path);
     sendJson(response, 200, rpcOk({ size: after.size, mtimeMs: after.mtimeMs }));
   } catch (error) {
-    sendJson(response, 200, rpcError(messageOf(error)));
+    const code = typeof error?.code === 'string' ? error.code : undefined;
+    sendJson(response, 200, rpcError(
+      code === 'ENOENT' ? missingFileMessage(path) : messageOf(error),
+      code
+    ));
   }
 }
 
@@ -1189,6 +1227,6 @@ export function apply(ctx) {
 export const __test = {
   pathIdentity, baseName, readAdditionalRoots, statusOfXY, splitNul, parseUnifiedHunks, imageTypeFor,
   decodeTextBytes, encodeText, detectLineEnding, applyLineEnding, WRITABLE_ENCODINGS,
-  compareEntries, listDirectory, handleFsWrite, MAX_WRITE_BODY, MAX_EDITABLE_BYTES,
+  compareEntries, listDirectory, handleFsWrite, handleFsRead, MAX_WRITE_BODY, MAX_EDITABLE_BYTES,
   sanitizeSettings, handleSettings, settingsPath, FONT_SCALE_MIN, FONT_SCALE_MAX, DEFAULT_SETTINGS
 };
