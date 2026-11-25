@@ -1,6 +1,6 @@
 {
   "name": "dsh-multi-root-files",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Multi-root file explorer for DeepSeek Harness: browse the session root and every additional workspace root, and open a file inline in the right sidebar.",
   "type": "module",
   "license": "MIT",

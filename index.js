@@ -38,7 +38,14 @@ const API = '/dsh-multi-root-files/api';
 /** Panel font scale: allowed range and step (a tenth at a time). */
 const FONT_SCALE_MIN = 0.8;
 const FONT_SCALE_MAX = 1.6;
-const DEFAULT_SETTINGS = { fontScale: 1 };
+/**
+ * Share of the split given to the file tree when a file is open. The drag
+ * handle clamps here so neither pane can be dragged to nothing: the tree keeps
+ * at least a fifth and the preview at least a fifth of the row.
+ */
+const TREE_RATIO_MIN = 0.2;
+const TREE_RATIO_MAX = 0.8;
+const DEFAULT_SETTINGS = { fontScale: 1, treeRatio: 0.45 };
 
 /** Additional roots one slot may report (matches the multi-root plugin's cap). */
 const MAX_ADDITIONAL_ROOTS = 64;
@@ -105,17 +112,29 @@ function settingsPath() {
   return join(dshHome(), 'storages', 'multi_root_files_settings.json');
 }
 
-/** Whitelist + clamp + snap to 0.1, mirroring the changes panel's rules. */
+/**
+ * Whitelist + clamp, mirroring the changes panel's rules.
+ *
+ * `fontScale` snaps to a 0.1 step (it is a discrete setting with buttons).
+ * `treeRatio` is the draggable split position and is kept as a continuous
+ * share rounded to three decimals: a pointer drag must land where it was
+ * released, not jump back to the nearest tenth.
+ */
 function sanitizeSettings(raw) {
-  let fontScale = DEFAULT_SETTINGS.fontScale;
+  const clean = { ...DEFAULT_SETTINGS };
   if (raw !== null && typeof raw === 'object') {
     const value = Number(raw.fontScale);
     if (Number.isFinite(value)) {
       const clamped = Math.min(FONT_SCALE_MAX, Math.max(FONT_SCALE_MIN, value));
-      fontScale = Math.round(clamped * 10) / 10;
+      clean.fontScale = Math.round(clamped * 10) / 10;
+    }
+    const ratio = Number(raw.treeRatio);
+    if (Number.isFinite(ratio)) {
+      const clampedRatio = Math.min(TREE_RATIO_MAX, Math.max(TREE_RATIO_MIN, ratio));
+      clean.treeRatio = Math.round(clampedRatio * 1000) / 1000;
     }
   }
-  return { fontScale };
+  return clean;
 }
 
 async function loadSettings() {
@@ -1144,10 +1163,11 @@ async function handleRoots(ctx, request, response) {
 /**
  * Read (GET) or write (POST) this panel's durable UI settings.
  *
- * Only `fontScale` is accepted (whitelist in sanitizeSettings). The desktop
- * web port changes on every launch, so browser localStorage is not durable;
- * the value lives in the plugin's own file under $DSH_HOME/storages and is
- * deliberately SEPARATE from dsh-multi-root-changes' setting.
+ * Only `fontScale` and `treeRatio` are accepted (whitelist in
+ * sanitizeSettings). The desktop web port changes on every launch, so browser
+ * localStorage is not durable; the values live in the plugin's own file under
+ * $DSH_HOME/storages and are deliberately SEPARATE from
+ * dsh-multi-root-changes' settings.
  */
 async function handleSettings(host, request, response) {
   if (request.method === 'GET') {
@@ -1157,7 +1177,13 @@ async function handleSettings(host, request, response) {
   if (request.method === 'POST') {
     const body = await readJsonBody(request);
     try {
-      sendJson(response, 200, await saveSettings(body));
+      // PATCH semantics: a request may carry one setting and must not reset
+      // the others, so the body is merged OVER what is already on disk. The
+      // font control sends only `fontScale`; the splitter sends only
+      // `treeRatio`.
+      const current = await loadSettings();
+      const patch = body !== null && typeof body === 'object' ? body : {};
+      sendJson(response, 200, await saveSettings({ ...current, ...patch }));
     } catch (error) {
       sendText(response, 500, error.message || 'settings write failed');
     }
@@ -1228,5 +1254,6 @@ export const __test = {
   pathIdentity, baseName, readAdditionalRoots, statusOfXY, splitNul, parseUnifiedHunks, imageTypeFor,
   decodeTextBytes, encodeText, detectLineEnding, applyLineEnding, WRITABLE_ENCODINGS,
   compareEntries, listDirectory, handleFsWrite, handleFsRead, MAX_WRITE_BODY, MAX_EDITABLE_BYTES,
-  sanitizeSettings, handleSettings, settingsPath, FONT_SCALE_MIN, FONT_SCALE_MAX, DEFAULT_SETTINGS
+  sanitizeSettings, handleSettings, settingsPath, FONT_SCALE_MIN, FONT_SCALE_MAX, DEFAULT_SETTINGS,
+  TREE_RATIO_MIN, TREE_RATIO_MAX
 };

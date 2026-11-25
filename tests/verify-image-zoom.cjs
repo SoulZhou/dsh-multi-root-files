@@ -18,24 +18,7 @@ const from = s + 'const CSS = `'.length;
 const to = clientSrc.indexOf('`;', from);
 const css = clientSrc.slice(from, to);
 
-function findChromium() {
-  const roots = [
-    path.join(process.env.LOCALAPPDATA || '', 'ms-playwright'),
-    path.join(process.env.USERPROFILE || '', 'AppData', 'Local', 'ms-playwright')
-  ];
-  for (const root of roots) {
-    if (!fs.existsSync(root)) continue;
-    for (const dir of fs.readdirSync(root)) {
-      for (const rel of ['chrome-win64/chrome.exe', 'chrome-headless-shell-win64/chrome-headless-shell.exe']) {
-        const p = path.join(root, dir, rel);
-        if (fs.existsSync(p)) return p;
-      }
-    }
-  }
-  throw new Error('no chromium under ms-playwright');
-}
-const playwright = require(path.join(
-  process.env.USERPROFILE, '.dsh', 'profiles', 'desktop', 'node_modules', 'playwright-core'));
+const browserHelper = require('./browser.cjs');
 
 function imgData(w, h) {
   return 'data:image/svg+xml;base64,' + Buffer.from(
@@ -60,7 +43,7 @@ function zoomAt(state, factor, p) {
 }
 
 (async () => {
-  const browser = await playwright.chromium.launch({ executablePath: findChromium(), headless: true });
+  const browser = await browserHelper.launch();
   try {
     const page = await browser.newPage({ viewport: { width: 1200, height: 800 } });
     await page.setContent(`<!doctype html><html><head><style>${css}</style></head>

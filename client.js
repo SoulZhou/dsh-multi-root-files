@@ -66,6 +66,16 @@ window.__ModuleLoader__.load({
     const FONT_MAX = 1.6;
     const FONT_STEP = 0.1;
     const FONT_DEFAULT = 1;
+    /**
+     * Split position when a file is open: the share of the row taken by the
+     * tree. Must match the host's TREE_RATIO_* constants. The drag handle
+     * clamps here so neither pane can be collapsed into nothing.
+     */
+    const TREE_MIN = 0.2;
+    const TREE_MAX = 0.8;
+    const TREE_DEFAULT = 0.45;
+    /** Arrow keys nudge the splitter by this share of the row (2%). */
+    const TREE_KEY_STEP = 0.02;
     /** Image preview zoom: 1 = fit-to-pane; the wheel/buttons clamp here. */
     const ZOOM_MIN = 0.25;
     const ZOOM_MAX = 8;
@@ -107,6 +117,8 @@ window.__ModuleLoader__.load({
         fontLarger: '放大字体',
         fontReset: '恢复默认字体大小',
         fontScaleTitle: '当前 {percent}% · A− 缩小 / A+ 放大 / 双击数值恢复默认',
+        splitterLabel: '拖动调整左右宽度（双击恢复一半）',
+        splitterTitle: '拖动这条线调整左边文件树与右边预览的宽度 · 双击恢复默认比例',
         markdownPreview: '预览',
         markdownSource: '源码',
         markdownPreviewTitle: '按 Markdown 排版渲染全文',
@@ -172,6 +184,8 @@ window.__ModuleLoader__.load({
         fontLarger: 'Larger font',
         fontReset: 'Reset font size',
         fontScaleTitle: 'Now {percent}% · A− to shrink / A+ to grow / double-click the number to reset',
+        splitterLabel: 'Drag to resize the two panes (double-click to split evenly)',
+        splitterTitle: 'Drag this line to resize the file tree and the preview · double-click to reset the split',
         markdownPreview: 'Preview',
         markdownSource: 'Source',
         markdownPreviewTitle: 'Render the whole file as formatted Markdown',
@@ -1550,6 +1564,101 @@ window.__ModuleLoader__.load({
         }, 'A+'));
     }
 
+    /**
+     * The draggable divider between the file tree and the preview.
+     *
+     * The split is ONE number: the share of the row taken by the tree. A drag
+     * converts the pointer's x (relative to the row) into that share, so the
+     * handle stays under the cursor instead of accumulating deltas. The parent
+     * owns `ratio`: onDrag previews it live (no round trip per pixel) and
+     * onCommit persists it ONCE when the gesture ends. Double-click and the
+     * Home/End keys reset; Left/Right nudge. The control is stateless, so a
+     * refused write can never leave the UI and the file disagreeing.
+     */
+    function Splitter(props) {
+      const { ratio, t, onDrag, onCommit, onReset } = props;
+
+      const onPointerDown = useCallback((event) => {
+        if (event.button !== undefined && event.button !== 0) return;
+        const handle = event.currentTarget;
+        const row = handle.parentElement;
+        if (!row) return;
+        event.preventDefault();
+        const startRatio = ratio;
+        let last = startRatio;
+        let moved = false;
+        try { handle.setPointerCapture?.(event.pointerId); } catch { /* ignore */ }
+        document.body.classList.add('mrfResizing');
+
+        const ratioAt = (clientX) => {
+          const rect = row.getBoundingClientRect();
+          if (!(rect.width > 0)) return last;
+          const share = (clientX - rect.left) / rect.width;
+          return Math.min(TREE_MAX, Math.max(TREE_MIN, share));
+        };
+        const move = (ev) => {
+          moved = true;
+          last = ratioAt(ev.clientX);
+          onDrag(last);
+        };
+        const finish = (ev) => {
+          window.removeEventListener('pointermove', move);
+          window.removeEventListener('pointerup', finish);
+          window.removeEventListener('pointercancel', cancel);
+          document.body.classList.remove('mrfResizing');
+          try { handle.releasePointerCapture?.(ev.pointerId); } catch { /* ignore */ }
+          if (moved) onCommit(last);
+        };
+        const cancel = () => {
+          window.removeEventListener('pointermove', move);
+          window.removeEventListener('pointerup', finish);
+          window.removeEventListener('pointercancel', cancel);
+          document.body.classList.remove('mrfResizing');
+          // A cancelled gesture (window lost focus, Esc) rolls back the preview.
+          onDrag(startRatio);
+        };
+        window.addEventListener('pointermove', move);
+        window.addEventListener('pointerup', finish);
+        window.addEventListener('pointercancel', cancel);
+      }, [ratio, onDrag, onCommit]);
+
+      const onKeyDown = useCallback((event) => {
+        const nudge = (delta) => {
+          event.preventDefault();
+          onCommit(Math.min(TREE_MAX, Math.max(TREE_MIN, ratio + delta)));
+        };
+        if (event.key === 'ArrowLeft') nudge(-TREE_KEY_STEP);
+        else if (event.key === 'ArrowRight') nudge(TREE_KEY_STEP);
+        else if (event.key === 'Home') nudge(TREE_MIN - ratio);
+        else if (event.key === 'End') nudge(TREE_MAX - ratio);
+        else if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onReset();
+        }
+      }, [ratio, onCommit, onReset]);
+
+      const percent = Math.round(ratio * 100);
+      return h('div', {
+        className: 'mrf-splitter',
+        role: 'separator',
+        'aria-orientation': 'vertical',
+        'aria-label': t('splitterLabel'),
+        'aria-valuenow': percent,
+        'aria-valuemin': Math.round(TREE_MIN * 100),
+        'aria-valuemax': Math.round(TREE_MAX * 100),
+        'aria-valuetext': `${percent}%`,
+        title: t('splitterTitle'),
+        tabIndex: 0,
+        onPointerDown,
+        onDoubleClick: () => onReset(),
+        onKeyDown
+      },
+        // The grip: three dots, purely decorative (the handle itself is the
+        // hit target, widened by ::before so a 6px line is easy to grab).
+        h('span', { className: 'mrf-splitterGrip', 'aria-hidden': 'true' },
+          h('i', null), h('i', null), h('i', null)));
+    }
+
     /* ------------------------------------------------------------ panel */
 
     function MultiRootFilesTab(props) {
@@ -1588,6 +1697,14 @@ window.__ModuleLoader__.load({
       // written back on every change. It is deliberately separate from
       // dsh-multi-root-changes' setting: the two panels are independent.
       const [fontScale, setFontScale] = useState(FONT_DEFAULT);
+      /**
+       * Durable split position: the share of the row taken by the tree while a
+       * file is open. Same file, same route as the font scale; `dragging`
+       * marks a live gesture so the pointer gets the ratio immediately and
+       * the disk write happens once, on release.
+       */
+      const [treeRatio, setTreeRatio] = useState(TREE_DEFAULT);
+      const draggingSplit = useRef(false);
       useEffect(() => {
         let live = true;
         fetchJson(ctxRef.current, `${API_BASE}/settings`)
@@ -1595,6 +1712,11 @@ window.__ModuleLoader__.load({
             if (!live) return;
             const value = Number(reply?.fontScale);
             if (Number.isFinite(value)) setFontScale(Math.min(FONT_MAX, Math.max(FONT_MIN, value)));
+            const ratio = Number(reply?.treeRatio);
+            if (Number.isFinite(ratio)) {
+              const clamped = Math.min(TREE_MAX, Math.max(TREE_MIN, ratio));
+              setTreeRatio(clamped);
+            }
           })
           .catch(() => { /* first run / host half not loaded yet: keep default */ });
         return () => { live = false; };
@@ -1609,6 +1731,36 @@ window.__ModuleLoader__.load({
           })
           .catch(() => { /* keep the chosen size for this session */ });
       }, []);
+
+      /**
+       * Move the splitter. During a drag this only previews (no request per
+       * pixel); `commitTreeRatio` persists the settled value, and also serves
+       * the keyboard/ double-click paths where there is no gesture to end.
+       */
+      const previewTreeRatio = useCallback((next) => {
+        const value = Math.min(TREE_MAX, Math.max(TREE_MIN, next));
+        draggingSplit.current = true;
+        setTreeRatio(value);
+      }, []);
+
+      const commitTreeRatio = useCallback((next) => {
+        const value = Math.min(TREE_MAX, Math.max(TREE_MIN, next));
+        draggingSplit.current = false;
+        setTreeRatio(value);
+        postPlain(ctxRef.current, `${API_BASE}/settings`, { treeRatio: value })
+          .then((reply) => {
+            const saved = Number(reply?.treeRatio);
+            if (!Number.isFinite(saved)) return;
+            // A newer gesture owns the ratio now; a slow reply must not yank it.
+            if (draggingSplit.current) return;
+            setTreeRatio(Math.min(TREE_MAX, Math.max(TREE_MIN, saved)));
+          })
+          .catch(() => { /* keep the chosen split for this session */ });
+      }, []);
+
+      const resetTreeRatio = useCallback(() => {
+        commitTreeRatio(TREE_DEFAULT);
+      }, [commitTreeRatio]);
 
       useEffect(() => {
         const read = () => {
@@ -2077,7 +2229,13 @@ window.__ModuleLoader__.load({
             onClick: () => { void load(); }
           }, '\u21bb'),
           h(FontSizeControl, { scale: fontScale, t, onChange: changeFontScale })),
-        h('div', { className: 'mrf-split' },
+        h('div', {
+          className: 'mrf-split',
+          // The split is ONE variable: the tree's share of the row. Setting it
+          // on the row keeps the dragger, the CSS and the persisted value in
+          // agreement (no inline widths to fall out of sync).
+          style: preview !== null ? { '--mrf-tree-share': `${treeRatio * 100}%` } : undefined
+        },
           h('div', { className: 'mrf-treeWrap' },
             h('div', { className: 'mrf-body' },
               registryFound === false ? h('div', { className: 'mrf-registry' }, t('registryMissing')) : null,
@@ -2104,14 +2262,22 @@ window.__ModuleLoader__.load({
                   })
                 : null)),
           preview !== null
-            ? h(PreviewPane, {
+            ? h(Fragment, null,
+              h(Splitter, {
+                ratio: treeRatio,
+                t,
+                onDrag: previewTreeRatio,
+                onCommit: commitTreeRatio,
+                onReset: resetTreeRatio
+              }),
+              h(PreviewPane, {
                 preview, t,
                 onClose: closePreview,
                 onOpenFolder: (path) => openEntryInFiles(parentDir(path)),
                 decoration,
                 onContextMenu: handleContextMenu,
                 onSave: savePreview
-              })
+              }))
             : null),
         h(ContextMenu, { menu: contextMenu, t, onCopy: menuCopy, onOpen: menuOpen }),
         h(Toast, { message: toast === null ? '' : t(toast.key) }));
@@ -2168,8 +2334,44 @@ window.__ModuleLoader__.load({
 .mrf-split { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .mrf-panel[data-preview='true'] .mrf-split { flex-direction: row; }
 .mrf-treeWrap { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.mrf-panel[data-preview='true'] .mrf-treeWrap { flex: 1 1 45%; min-width: 150px;
-  border-right: 1px solid var(--dsw-alias-border-l1); }
+/* With a file open the tree takes --mrf-tree-share of the row (default 45%)
+   and the preview takes the rest; the divider below is the only thing that
+   changes that share. min-width:0 lets the flex items actually shrink to the
+   share instead of being floored by their content's intrinsic width. */
+.mrf-panel[data-preview='true'] .mrf-treeWrap {
+  flex: 0 0 var(--mrf-tree-share, 45%); min-width: 0;
+  border-right: 0; }
+/* The draggable divider between the two panes. A 6px hit area is centred on
+   the seam with a ::before overhang, so the line looks thin but is easy to
+   grab; the body class suppresses text selection for the whole gesture. */
+.mrf-splitter { flex: none; width: 6px; margin: 0 -3px; position: relative;
+  z-index: 2; cursor: col-resize; background: transparent; touch-action: none;
+  display: flex; align-items: center; justify-content: center;
+  border: 0; padding: 0; }
+.mrf-splitter::before { content: ''; position: absolute; top: 0; bottom: 0;
+  left: 3px; width: 1px; background: var(--dsw-alias-border-l1);
+  transition: background-color .12s ease, width .12s ease; }
+.mrf-splitter::after { content: ''; position: absolute; top: 0; bottom: 0;
+  left: -3px; right: -3px; }
+.mrf-splitter:hover::before, .mrf-splitter:focus-visible::before {
+  width: 2px; background: var(--dsw-alias-state-business-primary); }
+.mrf-splitter:focus-visible { outline: 1px solid var(--dsw-alias-state-business-primary);
+  outline-offset: -2px; }
+/* The grip stays hidden until the seam is hovered/focused, so the two panes
+   look exactly like before until the user reaches for the line. */
+.mrf-splitterGrip { display: flex; flex-direction: column; gap: 2px;
+  align-items: center; justify-content: center; width: 8px; height: 26px;
+  border-radius: 4px; opacity: 0; transition: opacity .12s ease;
+  background: var(--dsw-alias-bg-layer-1, #161b19);
+  border: 1px solid var(--dsw-alias-border-l1); }
+.mrf-splitter:hover .mrf-splitterGrip, .mrf-splitter:focus-visible .mrf-splitterGrip {
+  opacity: 1; }
+.mrf-splitterGrip i { display: block; width: 2px; height: 2px; border-radius: 50%;
+  background: var(--dsw-alias-label-tertiary); }
+/* While a drag is live: no text selection anywhere, and one cursor for the
+   whole window (the pointer leaves the 6px line immediately). */
+body.mrfResizing { cursor: col-resize !important; }
+body.mrfResizing, body.mrfResizing * { user-select: none !important; }
 .mrf-body { flex: 1; min-height: 0; overflow: auto; padding: 4px 4px 12px; }
 .mrf-registry { padding: 6px 8px; font-size: 11px; line-height: 1.5;
   color: var(--dsw-alias-label-tertiary); }
@@ -2231,8 +2433,8 @@ window.__ModuleLoader__.load({
 .mrf-previewPane { flex: none; max-height: 45%; min-height: 120px; display: flex;
   flex-direction: column; border-top: 1px solid var(--dsw-alias-border-l1);
   background: var(--dsw-alias-bg-layer-1, #161b19); isolation: isolate; }
-.mrf-panel[data-preview='true'] .mrf-previewPane { flex: 1 1 55%; max-height: none;
-  min-height: 0; min-width: 0; border-top: 0; border-left: 1px solid var(--dsw-alias-border-l1); }
+.mrf-panel[data-preview='true'] .mrf-previewPane { flex: 1 1 0; max-height: none;
+  min-height: 0; min-width: 0; border-top: 0; border-left: 0; }
 .mrf-previewBar { display: flex; align-items: center; gap: 6px; padding: 4px 8px;
   flex: none; border-bottom: 1px solid var(--dsw-alias-border-l1); }
 .mrf-previewTitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;

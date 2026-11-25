@@ -55,28 +55,49 @@ async function call(method, body) {
 }
 
 console.log('\n=== sanitizeSettings (whitelist + range + step) ===');
-check('fresh -> default 1', JSON.stringify(sanitizeSettings({})) === '{"fontScale":1}');
-check('null -> default', JSON.stringify(sanitizeSettings(null)) === '{"fontScale":1}');
-check('unknown keys dropped', JSON.stringify(sanitizeSettings({ fontScale: 1.3, evil: 1 })) === '{"fontScale":1.3}');
+check('fresh -> defaults', JSON.stringify(sanitizeSettings({})) === '{"fontScale":1,"treeRatio":0.45}',
+  JSON.stringify(sanitizeSettings({})));
+check('null -> defaults', JSON.stringify(sanitizeSettings(null)) === '{"fontScale":1,"treeRatio":0.45}',
+  JSON.stringify(sanitizeSettings(null)));
+check('unknown keys dropped', JSON.stringify(sanitizeSettings({ fontScale: 1.3, evil: 1 })) === '{"fontScale":1.3,"treeRatio":0.45}',
+  JSON.stringify(sanitizeSettings({ fontScale: 1.3, evil: 1 })));
 check('below min clamped to 0.8', sanitizeSettings({ fontScale: 0.1 }).fontScale === 0.8);
 check('above max clamped to 1.6', sanitizeSettings({ fontScale: 9 }).fontScale === 1.6);
 check('garbage -> default', sanitizeSettings({ fontScale: 'big' }).fontScale === 1);
 check('snaps to 0.1 step', sanitizeSettings({ fontScale: 1.27 }).fontScale === 1.3);
 check('settings file is this plugin\'s OWN', /multi_root_files_settings\.json$/.test(settingsPath()), settingsPath());
 
+console.log('\n=== split ratio (the draggable divider) ===');
+check('default split is 45%', sanitizeSettings({}).treeRatio === 0.45);
+check('below min clamped to 0.2', sanitizeSettings({ treeRatio: -2 }).treeRatio === 0.2);
+check('above max clamped to 0.8', sanitizeSettings({ treeRatio: 5 }).treeRatio === 0.8);
+check('NaN falls back to the default', sanitizeSettings({ treeRatio: 'wide' }).treeRatio === 0.45);
+check('a dragged value keeps its position (no 0.1 snap)',
+  sanitizeSettings({ treeRatio: 0.537 }).treeRatio === 0.537);
+check('ratio rounds to three decimals', sanitizeSettings({ treeRatio: 0.5371 }).treeRatio === 0.537);
+
 console.log('\n=== /settings GET/POST through the real handler ===');
 try {
   const first = await call('GET');
-  check('GET first run -> 200 default', first.status === 200 && first.json?.fontScale === 1, first.text);
+  check('GET first run -> 200 defaults',
+    first.status === 200 && first.json?.fontScale === 1 && first.json?.treeRatio === 0.45, first.text);
   const saved = await call('POST', { fontScale: 1.4, ignored: true });
   check('POST -> 200 sanitized', saved.status === 200 && saved.json?.fontScale === 1.4 && saved.json?.ignored === undefined, saved.text);
+  check('POST keeps the untouched setting', saved.json?.treeRatio === 0.45, saved.text);
   const back = await call('GET');
   check('GET reads persisted value back', back.json?.fontScale === 1.4, back.text);
   check('file written to disk', existsSync(settingsPath()), settingsPath());
   const raw = JSON.parse(readFileSync(settingsPath(), 'utf8'));
-  check('disk contains ONLY fontScale', JSON.stringify(Object.keys(raw).sort()) === '["fontScale"]', JSON.stringify(raw));
+  check('disk contains ONLY the two settings',
+    JSON.stringify(Object.keys(raw).sort()) === '["fontScale","treeRatio"]', JSON.stringify(raw));
+  const split = await call('POST', { treeRatio: 0.62 });
+  check('POST treeRatio alone leaves fontScale intact',
+    split.json?.treeRatio === 0.62 && split.json?.fontScale === 1.4, split.text);
+  const clampedSplit = await call('POST', { treeRatio: 9 });
+  check('POST clamps the split to 0.8', clampedSplit.json?.treeRatio === 0.8, clampedSplit.text);
   const clamped = await call('POST', { fontScale: -5 });
   check('POST clamps out-of-range to 0.8', clamped.json?.fontScale === 0.8, clamped.text);
+  check('clamping fontScale never rewrites the split', clamped.json?.treeRatio === 0.8, clamped.text);
   const bad = await call('DELETE');
   check('unsupported method -> 405', bad.status === 405, `status=${bad.status}`);
 } catch (error) {

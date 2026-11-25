@@ -17,26 +17,7 @@ const css = clientSrc.slice(from, to);
 const scaled = css.replace(/font-size:\s*(\d+(?:\.\d+)?)px/g,
   (_m, px) => `font-size: calc(${px}px * var(--mrf-scale, 1))`);
 
-function findChromium() {
-  const roots = [
-    path.join(process.env.LOCALAPPDATA || '', 'ms-playwright'),
-    path.join(process.env.USERPROFILE || '', 'AppData', 'Local', 'ms-playwright')
-  ];
-  for (const root of roots) {
-    if (!fs.existsSync(root)) continue;
-    for (const dir of fs.readdirSync(root)) {
-      for (const rel of ['chrome-win64/chrome.exe', 'chrome-win/chrome.exe',
-        'chrome-headless-shell-win64/chrome-headless-shell.exe',
-        'chrome-headless-shell-win/chrome-headless-shell.exe']) {
-        const p = path.join(root, dir, rel);
-        if (fs.existsSync(p)) return p;
-      }
-    }
-  }
-  throw new Error('no chromium under ms-playwright');
-}
-const playwright = require(path.join(
-  process.env.USERPROFILE, '.dsh', 'profiles', 'desktop', 'node_modules', 'playwright-core'));
+const browserHelper = require('./browser.cjs');
 
 let failures = 0;
 function check(name, condition, detail) {
@@ -47,7 +28,7 @@ function check(name, condition, detail) {
 }
 
 (async () => {
-  const browser = await playwright.chromium.launch({ executablePath: findChromium(), headless: true });
+  const browser = await browserHelper.launch();
   try {
     const page = await browser.newPage();
     await page.setContent(`<!doctype html><style>${scaled}</style>
