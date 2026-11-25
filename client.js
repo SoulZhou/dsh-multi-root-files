@@ -1073,8 +1073,12 @@ window.__ModuleLoader__.load({
       // the whole file text (`value.content`), so no extra host read is needed.
       // "源码" falls back to the original line-by-line view; the toggle only
       // exists for a text .md-ish file (not an image or a binary blob).
+      // `preview.image` is NULL for a non-image file: fetchImage() resolves to
+      // null instead of undefined, so `=== undefined` here silently sent every
+      // .md file to the line-by-line fallback. Both nullish values mean "not an
+      // image" and must let the Markdown branch through.
       const isMd = isMarkdownPath(preview.path)
-        && preview.image === undefined
+        && preview.image == null
         && value?.kind !== 'binary'
         && value?.kind !== 'too-large';
       const [view, setView] = useState('preview');

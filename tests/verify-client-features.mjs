@@ -84,6 +84,11 @@ check('preview branch renders MarkdownBody', /h\(MarkdownBody, \{ content: Strin
 check('source branch keeps the line view', /mrf-codeLine/.test(clientSrc));
 check('toggle uses both labels', /t\('markdownPreview'\)/.test(clientSrc) && /t\('markdownSource'\)/.test(clientSrc));
 check('image / binary / too-large keep their own branches', /value\?\.kind === 'binary'/.test(clientSrc) && /value\?\.kind === 'too-large'/.test(clientSrc));
+// Regression: fetchImage() resolves to null (not undefined) for a non-image
+// file, so an `=== undefined` image gate sent every .md to the source view.
+const isMdGate = /const isMd = [\s\S]{0,240}?;/.exec(clientSrc)?.[0] ?? '';
+check('isMd accepts a nullish image (renders .md at all)', /preview\.image == null/.test(isMdGate), isMdGate.replace(/\s+/g, ' ').slice(0, 160));
+check('isMd no longer uses an undefined-only image gate', !/preview\.image === undefined/.test(isMdGate));
 
 console.log('\n=== font-size setting wiring ===');
 check('host registers /settings', /path: `\$\{API\}\/settings`/.test(indexSrc));
