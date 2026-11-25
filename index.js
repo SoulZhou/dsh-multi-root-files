@@ -17,12 +17,16 @@
  * while it loads): an absolute path outside cwd resolves fine even when that
  * upstream plugin failed to load after a DSH upgrade.
  *
- * Read-only over the workspace: this plugin never writes, renames or deletes
- * anything. Opening a file is the sidebar editor's job (still inside the right
- * sidebar). The single OS-level action it offers is "open in the file
- * manager": /open asks the operating system to REVEAL one path in Explorer /
- * Finder / the desktop's file manager — it launches no editor, accepts no
- * arguments, and can only point at a real file or folder.
+ * Writes exactly one thing: /fs.write saves the text a human edited in this
+ * panel's own editor, for a file it has already read as text. It never
+ * creates, renames, moves or deletes a file, never touches a binary or an
+ * oversized file, and refuses to run when the file changed on disk since the
+ * editor loaded it. The text keeps the file's OWN encoding and line endings
+ * (a GBK document is written back as GBK), so saving one paragraph does not
+ * rewrite every Chinese line in the diff.
+ *
+ * /open is the only OS-level action (REVEAL one path in Explorer / Finder);
+ * it launches no editor and accepts no arguments.
  */
 import { execFile } from 'node:child_process';
 import { mkdir, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
@@ -56,6 +60,12 @@ const MAX_TREE_PATHS = 64;
 const MAX_EDITABLE_BYTES = 5 * 1024 * 1024;
 /** Bytes read from an oversized file, enough to sniff its encoding. */
 const READ_HEAD_LIMIT = 4096;
+/**
+ * Ceiling on one save request. The text itself is capped at
+ * MAX_EDITABLE_BYTES; the rest is JSON escaping headroom (a 4-byte character
+ * can become a 12-byte `\uXXXX` pair, and Windows newlines double).
+ */
+const MAX_WRITE_BODY = MAX_EDITABLE_BYTES * 4 + 64 * 1024;
 
 /** Image types the preview can draw, by extension. */
 const IMAGE_TYPES = {
@@ -359,25 +369,85 @@ function hasIncompleteUtf8Tail(bytes) {
   return false;
 }
 
-/** Decode a text buffer, or `null` when it looks binary. */
+/**
+ * Decode a text buffer, or `null` when it looks binary. The result names the
+ * encoding it picked, because saving has to put the bytes back the same way.
+ */
 function decodeTextBytes(bytes, truncated = false) {
-  if (startsWith(bytes, UTF32LE_BOM)) return { content: decodeUtf32(bytes.subarray(4), true) };
-  if (startsWith(bytes, UTF32BE_BOM)) return { content: decodeUtf32(bytes.subarray(4), false) };
-  if (startsWith(bytes, UTF8_BOM)) return { content: bytes.subarray(3).toString('utf8') };
-  if (startsWith(bytes, UTF16LE_BOM)) return { content: decodeUtf16(bytes.subarray(2), true) };
-  if (startsWith(bytes, UTF16BE_BOM)) return { content: decodeUtf16(bytes.subarray(2), false) };
+  if (startsWith(bytes, UTF32LE_BOM)) return { content: decodeUtf32(bytes.subarray(4), true), encoding: 'utf32le-bom' };
+  if (startsWith(bytes, UTF32BE_BOM)) return { content: decodeUtf32(bytes.subarray(4), false), encoding: 'utf32be-bom' };
+  if (startsWith(bytes, UTF8_BOM)) return { content: bytes.subarray(3).toString('utf8'), encoding: 'utf8-bom' };
+  if (startsWith(bytes, UTF16LE_BOM)) return { content: decodeUtf16(bytes.subarray(2), true), encoding: 'utf16le-bom' };
+  if (startsWith(bytes, UTF16BE_BOM)) return { content: decodeUtf16(bytes.subarray(2), false), encoding: 'utf16be-bom' };
   const utf16 = bomlessUtf16(bytes);
-  if (utf16 !== undefined) return { content: decodeUtf16(bytes, utf16 === 'utf16le') };
+  if (utf16 !== undefined) return { content: decodeUtf16(bytes, utf16 === 'utf16le'), encoding: utf16 };
   if (bytes.includes(0)) return null;
   const utf8 = tryDecode(UTF8_DECODER, bytes);
-  if (utf8 !== undefined) return { content: utf8 };
-  if (truncated && hasIncompleteUtf8Tail(bytes)) return { content: bytes.toString('utf8') };
+  if (utf8 !== undefined) return { content: utf8, encoding: 'utf8' };
+  if (truncated && hasIncompleteUtf8Tail(bytes)) return { content: bytes.toString('utf8'), encoding: 'utf8' };
   const gb18030 = tryDecode(GB18030_DECODER, bytes);
-  if (gb18030 !== undefined && hasGb18030FourByteSequence(bytes)) return { content: gb18030 };
+  if (gb18030 !== undefined && hasGb18030FourByteSequence(bytes)) return { content: gb18030, encoding: 'gb18030' };
   const gbk = tryDecode(GBK_DECODER, bytes);
-  if (gbk !== undefined) return { content: gbk };
-  if (gb18030 !== undefined) return { content: gb18030 };
-  return { content: bytes.toString('utf8') };
+  if (gbk !== undefined) return { content: gbk, encoding: 'gbk' };
+  if (gb18030 !== undefined) return { content: gb18030, encoding: 'gb18030' };
+  return { content: bytes.toString('utf8'), encoding: 'utf8' };
+}
+
+/**
+ * Encodings we can write back byte-for-byte. Node decodes gbk / gb18030 but
+ * ships no encoder for them, so a "save" there would silently rewrite the
+ * whole file as UTF-8 and turn every Chinese line into a diff. Those two are
+ * therefore readable but NOT editable — an honest refusal beats quiet damage.
+ */
+const WRITABLE_ENCODINGS = new Set([
+  'utf8', 'utf8-bom',
+  'utf16le', 'utf16le-bom', 'utf16be', 'utf16be-bom',
+  'utf32le-bom', 'utf32be-bom'
+]);
+
+function encodeUtf32(text, littleEndian, withBom) {
+  const points = [...text];
+  const body = Buffer.alloc(points.length * 4);
+  for (let i = 0; i < points.length; i += 1) {
+    const codePoint = points[i].codePointAt(0);
+    if (littleEndian) body.writeUInt32LE(codePoint, i * 4);
+    else body.writeUInt32BE(codePoint, i * 4);
+  }
+  if (!withBom) return body;
+  return Buffer.concat([littleEndian ? UTF32LE_BOM : UTF32BE_BOM, body]);
+}
+
+/** Re-encode editor text in the file's own encoding. Throws when unsupported. */
+function encodeText(text, encoding) {
+  switch (encoding) {
+    case 'utf8': return Buffer.from(text, 'utf8');
+    case 'utf8-bom': return Buffer.concat([UTF8_BOM, Buffer.from(text, 'utf8')]);
+    case 'utf16le': return Buffer.from(text, 'utf16le');
+    case 'utf16le-bom': return Buffer.concat([UTF16LE_BOM, Buffer.from(text, 'utf16le')]);
+    case 'utf16be': { const body = Buffer.from(text, 'utf16le'); body.swap16(); return body; }
+    case 'utf16be-bom': { const body = Buffer.from(text, 'utf16le'); body.swap16(); return Buffer.concat([UTF16BE_BOM, body]); }
+    case 'utf32le-bom': return encodeUtf32(text, true, true);
+    case 'utf32be-bom': return encodeUtf32(text, false, true);
+    default: throw new Error(`cannot write ${encoding} without changing its encoding`);
+  }
+}
+
+/** Which line ending the file already uses, so a save keeps it. */
+function detectLineEnding(text) {
+  let total = 0;
+  let crlf = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] !== '\n') continue;
+    total += 1;
+    if (i > 0 && text[i - 1] === '\r') crlf += 1;
+  }
+  return total > 0 && crlf * 2 > total ? '\r\n' : '\n';
+}
+
+/** A textarea hands back LF only; put the file's own ending back. */
+function applyLineEnding(text, eol) {
+  const normalized = text.replace(/\r\n/g, '\n');
+  return eol === '\r\n' ? normalized.replace(/\n/g, '\r\n') : normalized;
 }
 
 /** Directory-first, case-insensitive name ordering (mirrors the sidebar). */
@@ -476,9 +546,78 @@ async function handleFsRead(ctx, request, response) {
       }));
       return;
     }
-    sendJson(response, 200, rpcOk({ kind: 'text', content: decoded.content, size, mtimeMs: info.mtimeMs }));
+    sendJson(response, 200, rpcOk({
+      kind: 'text',
+      content: decoded.content,
+      size,
+      mtimeMs: info.mtimeMs,
+      encoding: decoded.encoding,
+      eol: detectLineEnding(decoded.content),
+      editable: WRITABLE_ENCODINGS.has(decoded.encoding)
+    }));
   } finally {
     await handle.close();
+  }
+}
+
+/**
+ * POST /fs.write: save text a human edited here. body {path, content, mtimeMs}.
+ * Refuses when the file moved on disk (mtimeMs mismatch), when it is not text,
+ * and when its encoding has no Node encoder — never rewrites a GBK file as
+ * UTF-8. `expectedMtimeMs` may be omitted to accept whatever is on disk.
+ */
+async function handleFsWrite(ctx, request, response) {
+  const body = await readJsonBody(request, MAX_WRITE_BODY);
+  const path = typeof body?.path === 'string' ? body.path : '';
+  const content = typeof body?.content === 'string' ? body.content : undefined;
+  if (path === '') { sendJson(response, 200, rpcError('path must be a non-empty string')); return; }
+  if (content === undefined) { sendJson(response, 200, rpcError('content must be a string')); return; }
+
+  let info;
+  try {
+    info = await stat(path);
+  } catch (error) {
+    sendJson(response, 200, rpcError(messageOf(error)));
+    return;
+  }
+  if (info.isDirectory()) { sendJson(response, 200, rpcError(`"${path}" is a directory`)); return; }
+  if (info.size > MAX_EDITABLE_BYTES) {
+    sendJson(response, 200, rpcError('file is too large to edit here'));
+    return;
+  }
+  if (Buffer.byteLength(content, 'utf8') > MAX_EDITABLE_BYTES * 4) {
+    sendJson(response, 200, rpcError('text is too large to save here'));
+    return;
+  }
+  // Another tool (or the agent) rewrote the file while the editor was open.
+  // Saving then would silently discard their work, so refuse and say so.
+  const expected = typeof body?.mtimeMs === 'number' ? body.mtimeMs : undefined;
+  if (expected !== undefined && Math.abs(info.mtimeMs - expected) > 0.5) {
+    sendJson(response, 200, rpcError('the file changed on disk since you opened it'));
+    return;
+  }
+
+  let bytes;
+  try {
+    const raw = await readFile(path);
+    const decoded = decodeTextBytes(raw);
+    if (decoded === null) { sendJson(response, 200, rpcError('this file is not text')); return; }
+    if (!WRITABLE_ENCODINGS.has(decoded.encoding)) {
+      sendJson(response, 200, rpcError(`this file is ${decoded.encoding}; saving it here would change its encoding`));
+      return;
+    }
+    bytes = encodeText(applyLineEnding(content, detectLineEnding(decoded.content)), decoded.encoding);
+  } catch (error) {
+    sendJson(response, 200, rpcError(messageOf(error)));
+    return;
+  }
+
+  try {
+    await writeFile(path, bytes);
+    const after = await stat(path);
+    sendJson(response, 200, rpcOk({ size: after.size, mtimeMs: after.mtimeMs }));
+  } catch (error) {
+    sendJson(response, 200, rpcError(messageOf(error)));
   }
 }
 
@@ -1031,6 +1170,7 @@ export function apply(ctx) {
         registerPost(host, 'roots', handleRoots),
         registerPost(host, 'fs.trees', handleFsTrees),
         registerPost(host, 'fs.read', handleFsRead),
+        registerPost(host, 'fs.write', handleFsWrite),
         registerPost(host, 'status', handleStatus),
         registerPost(host, 'image', handleImage),
         registerPost(host, 'diff', handleDiff),
@@ -1048,6 +1188,7 @@ export function apply(ctx) {
 
 export const __test = {
   pathIdentity, baseName, readAdditionalRoots, statusOfXY, splitNul, parseUnifiedHunks, imageTypeFor,
-  decodeTextBytes, compareEntries, listDirectory,
+  decodeTextBytes, encodeText, detectLineEnding, applyLineEnding, WRITABLE_ENCODINGS,
+  compareEntries, listDirectory, handleFsWrite, MAX_WRITE_BODY, MAX_EDITABLE_BYTES,
   sanitizeSettings, handleSettings, settingsPath, FONT_SCALE_MIN, FONT_SCALE_MAX, DEFAULT_SETTINGS
 };

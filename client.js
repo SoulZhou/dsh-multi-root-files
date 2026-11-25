@@ -111,6 +111,19 @@ window.__ModuleLoader__.load({
         markdownSource: '源码',
         markdownPreviewTitle: '按 Markdown 排版渲染全文',
         markdownSourceTitle: '查看逐行源码',
+        markdownEdit: '编辑',
+        markdownEditTitle: '编辑这个文件的文本',
+        editorSave: '保存',
+        editorSaveTitle: '写回磁盘（Ctrl+S）',
+        editorSaving: '保存中…',
+        editorCancel: '取消',
+        editorCancelTitle: '放弃这次修改（Esc）',
+        editorDirty: '未保存',
+        editorSaved: '已保存',
+        editorSaveFailed: '保存失败',
+        editorConflict: '文件在磁盘上已被改动，未覆盖。取消后可重新打开再改。',
+        editorReadOnlyEncoding: '这个文件的编码（{encoding}）无法安全写回，只能查看。',
+        editorUnchanged: '没有修改，无需保存',
         imageZoomIn: '放大图片',
         imageZoomOut: '缩小图片',
         imageZoomReset: '恢复适应窗口（双击百分比）',
@@ -161,6 +174,19 @@ window.__ModuleLoader__.load({
         markdownSource: 'Source',
         markdownPreviewTitle: 'Render the whole file as formatted Markdown',
         markdownSourceTitle: 'Show the line-by-line source',
+        markdownEdit: 'Edit',
+        markdownEditTitle: 'Edit the text of this file',
+        editorSave: 'Save',
+        editorSaveTitle: 'Write back to disk (Ctrl+S)',
+        editorSaving: 'Saving…',
+        editorCancel: 'Cancel',
+        editorCancelTitle: 'Discard these changes (Esc)',
+        editorDirty: 'Unsaved',
+        editorSaved: 'Saved',
+        editorSaveFailed: 'Could not save',
+        editorConflict: 'The file changed on disk; nothing was overwritten. Cancel, reopen it, and edit again.',
+        editorReadOnlyEncoding: 'This file is {encoding}; saving it here would change its encoding, so it is read-only.',
+        editorUnchanged: 'Nothing changed — no need to save',
         imageZoomIn: 'Zoom in',
         imageZoomOut: 'Zoom out',
         imageZoomReset: 'Fit to window (double-click the percentage)',
@@ -360,6 +386,37 @@ window.__ModuleLoader__.load({
       try { parsed = await response.json(); } catch { /* keep the status below */ }
       if (!response.ok || parsed?.ok !== true) {
         throw new Error(parsed?.error?.message ?? `HTTP ${response.status}`);
+      }
+      return parsed?.value ?? null;
+    }
+
+    /**
+     * Save text the human edited in this panel's editor. `mtimeMs` is the stamp
+     * the editor loaded, so the host can refuse to clobber a file that another
+     * tool rewrote meanwhile. Errors carry the host's own message (and a flag
+     * for the conflict case) so the bar can say exactly what happened.
+     */
+    async function saveFile(ctx, path, content, mtimeMs) {
+      const body = { path, content };
+      if (typeof mtimeMs === 'number') body.mtimeMs = mtimeMs;
+      let response;
+      try {
+        response = await fetch(routeUrl(ctx, `${API_BASE}/fs.write`), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+      } catch (error) {
+        throw new Error(error instanceof Error ? error.message : String(error));
+      }
+      let parsed = null;
+      try { parsed = await response.json(); } catch { /* keep the status below */ }
+      if (!response.ok || parsed?.ok !== true) {
+        const message = parsed?.error?.message ?? `HTTP ${response.status}`;
+        const failure = new Error(message);
+        failure.conflict = /changed on disk/i.test(message);
+        failure.readOnlyEncoding = /encoding/i.test(message);
+        throw failure;
       }
       return parsed?.value ?? null;
     }
@@ -1059,7 +1116,7 @@ window.__ModuleLoader__.load({
     const PREVIEW_LINE_CAP = 4000;
 
     function PreviewPane(props) {
-      const { preview, t, onClose, onOpenFolder, decoration, onContextMenu } = props;
+      const { preview, t, onClose, onOpenFolder, decoration, onContextMenu, onSave } = props;
       const value = preview.value;
       // The open file carries the same git state the tree shows: the reader
       // must not have to look back at the tree to know whether the file in
@@ -1092,7 +1149,83 @@ window.__ModuleLoader__.load({
       const [lightboxOpen, setLightboxOpen] = useState(false);
       useEffect(() => { setLightboxOpen(false); }, [preview.path]);
 
-      const toggle = isMd
+      /* ------------------------------------------------------------ editor
+         The panel can write text back to disk, so it keeps a small state
+         machine: which file the textarea holds, what it held when the editor
+         opened (to tell a real change from a no-op, and to hand the host the
+         mtime stamp it needs to detect an outside rewrite), and whether a
+         save is in flight. */
+      const isText = preview.image == null && value?.kind === 'text';
+      const canEdit = isText && value?.editable !== false && typeof onSave === 'function';
+      const [editing, setEditing] = useState(false);
+      const [saving, setSaving] = useState(false);
+      const [draft, setDraft] = useState('');
+      const [baseline, setBaseline] = useState('');
+      const [saveError, setSaveError] = useState(null);
+      const editorRef = useRef(null);
+
+      // Switching files always ends an edit; a draft never leaks across files.
+      useEffect(() => {
+        setEditing(false);
+        setSaving(false);
+        setSaveError(null);
+        setDraft('');
+        setBaseline('');
+      }, [preview.path]);
+
+      const dirty = editing && draft !== baseline;
+
+      const startEdit = useCallback(() => {
+        const text = String(value?.content ?? '');
+        setDraft(text);
+        setBaseline(text);
+        setSaveError(null);
+        setEditing(true);
+      }, [value]);
+
+      const cancelEdit = useCallback(() => {
+        setEditing(false);
+        setSaving(false);
+        setSaveError(null);
+        setDraft('');
+        setBaseline('');
+      }, []);
+
+      const commitEdit = useCallback(async () => {
+        if (typeof onSave !== 'function') return;
+        if (!dirty) { setEditing(false); return; }
+        setSaving(true);
+        setSaveError(null);
+        try {
+          await onSave(preview.path, draft, value?.mtimeMs);
+          setBaseline(draft);
+          setEditing(false);
+        } catch (error) {
+          setSaveError(error instanceof Error ? error.message : String(error));
+        } finally {
+          setSaving(false);
+        }
+      }, [onSave, preview.path, draft, baseline, dirty, value]);
+
+      // Ctrl/Cmd+S saves; Esc leaves the editor unless a save is in flight.
+      const onEditorKeyDown = useCallback((event) => {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+          event.preventDefault();
+          void commitEdit();
+          return;
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          if (!saving) cancelEdit();
+        }
+      }, [commitEdit, cancelEdit, saving]);
+
+      // Put the caret in the textarea the moment the editor opens.
+      useLayoutEffect(() => {
+        if (editing && editorRef.current) editorRef.current.focus();
+      }, [editing]);
+
+      const toggle = isMd && !editing
         ? h('div', { className: 'mrf-mdToggle' },
           h('button', {
             type: 'button',
@@ -1107,6 +1240,46 @@ window.__ModuleLoader__.load({
             onClick: () => setView('source')
           }, t('markdownSource')))
         : null;
+
+      // Editing is offered for any file the host read as TEXT and can write
+      // back in its own encoding. A GBK document is deliberately read-only:
+      // Node has no GBK encoder, so "saving" it would rewrite every Chinese
+      // line as UTF-8 and turn one paragraph into a whole-file diff.
+      const editorActions = editing
+        ? h('div', { className: 'mrf-mdToggle' },
+          h('button', {
+            type: 'button',
+            className: 'mrf-mdToggleBtn mrf-mdToggleActive',
+            title: t('editorSaveTitle'),
+            disabled: saving,
+            onClick: () => { void commitEdit(); }
+          }, saving ? t('editorSaving') : t('editorSave')),
+          h('button', {
+            type: 'button',
+            className: 'mrf-mdToggleBtn',
+            title: t('editorCancelTitle'),
+            disabled: saving,
+            onClick: cancelEdit
+          }, t('editorCancel')))
+        : canEdit
+          ? h('button', {
+              type: 'button',
+              className: 'mrf-mdToggleBtn mrf-editButton',
+              title: t('markdownEditTitle'),
+              onClick: startEdit
+            }, t('markdownEdit'))
+          : null;
+
+      // The encoding chip only appears for a text file we must not rewrite
+      // (GBK / GB18030): it explains why there is no Edit button at all.
+      let dirtyTag = null;
+      if (editing && dirty) dirtyTag = h('span', { className: 'mrf-previewTag' }, t('editorDirty'));
+      else if (isText && value?.editable === false) {
+        dirtyTag = h('span', {
+          className: 'mrf-previewTag',
+          title: t('editorReadOnlyEncoding', { encoding: String(value.encoding ?? '') })
+        }, String(value.encoding ?? ''));
+      }
 
       // Inline image toolbar: open the full-window viewer + open the folder.
       const imageTools = isImage
@@ -1154,6 +1327,24 @@ window.__ModuleLoader__.load({
       } else if (value?.kind === 'too-large') {
         body = h('div', { className: 'mrf-note mrf-pad' },
           `${t('previewTooLarge')}${value.size === undefined ? '' : ` · ${formatSize(value.size)}`}`);
+      } else if (editing) {
+        // A plain textarea, deliberately: the file may be Markdown, JSON, YAML,
+        // or an INI, and every syntax highlighter we could ship would be wrong
+        // about one of them while still eating the keys the panel needs.
+        body = h('div', { className: 'mrf-editorWrap' },
+          saveError !== null
+            ? h('div', { className: 'mrf-note mrf-noteError mrf-pad' }, `${t('editorSaveFailed')}: ${saveError}`)
+            : null,
+          h('textarea', {
+            ref: editorRef,
+            className: 'mrf-editor',
+            spellCheck: false,
+            wrap: 'off',
+            value: draft,
+            onInput: (event) => setDraft(event.target.value),
+            onChange: (event) => setDraft(event.target.value),
+            onKeyDown: onEditorKeyDown
+          }));
       } else if (isMd && view === 'preview') {
         body = h('div', { className: 'mrf-mdScroll' }, h(MarkdownBody, { content: String(value?.content ?? '') }));
       } else {
@@ -1197,6 +1388,8 @@ window.__ModuleLoader__.load({
               }, status.letter)
             : null,
           toggle,
+          editorActions,
+          dirtyTag,
           imageTools,
           h('button', {
             type: 'button',
@@ -1712,6 +1905,38 @@ window.__ModuleLoader__.load({
         setPreview(null);
       }, []);
 
+      /**
+       * Save the text the editor holds, then refresh what depends on the file's
+       * content: the changed-line decoration (so the M badge and the diff ink
+       * match the new bytes) and the diff of the file being previewed.
+       */
+      const savePreview = useCallback(async (path, content, mtimeMs) => {
+        const saved = await saveFile(ctxRef.current, path, content, mtimeMs);
+        setPreview((current) => {
+          if (current === null || pathKey(current.path) !== pathKey(path)) return current;
+          const value = current.value ?? {};
+          return {
+            ...current,
+            value: {
+              ...value,
+              content,
+              size: saved?.size ?? value.size,
+              mtimeMs: saved?.mtimeMs ?? value.mtimeMs
+            }
+          };
+        });
+        setToast({ key: 'editorSaved' });
+        // The file on disk is what git compares, so the diff must be re-read.
+        const diff = await fetchDiff(ctxRef.current, path);
+        setPreview((current) => (
+          current === null || pathKey(current.path) !== pathKey(path)
+            ? current
+            : { ...current, diff }
+        ));
+        void refreshDecoration();
+        return saved;
+      }, [refreshDecoration]);
+
       /* ------------------------------------------- context menu and toast */
 
       const closeMenu = useCallback(() => setContextMenu(null), []);
@@ -1854,7 +2079,8 @@ window.__ModuleLoader__.load({
                 onClose: closePreview,
                 onOpenFolder: (path) => openEntryInFiles(parentDir(path)),
                 decoration,
-                onContextMenu: handleContextMenu
+                onContextMenu: handleContextMenu,
+                onSave: savePreview
               })
             : null),
         h(ContextMenu, { menu: contextMenu, t, onCopy: menuCopy, onOpen: menuOpen }),
@@ -2044,6 +2270,22 @@ window.__ModuleLoader__.load({
 .mrf-lineAdded .mrf-lineNo { color: var(--dsw-alias-state-success-primary); font-weight: 700; }
 .mrf-lineRemoved { background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 16%, transparent); }
 .mrf-lineRemoved .mrf-lineNo { color: var(--dsw-alias-state-error-primary); font-weight: 700; }
+/* Editor: a real textarea that fills the pane. It keeps its own scroll, wraps
+   nowhere (a Markdown table or a minified JSON line must not be reflowed into
+   something the user did not write), and uses the code face for alignment. */
+.mrf-editorWrap { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.mrf-editorWrap .mrf-note { flex: none; }
+.mrf-editor {
+  flex: 1; min-height: 0; width: 100%; box-sizing: border-box; margin: 0;
+  padding: 8px 12px; border: 0; outline: none; resize: none;
+  background: var(--dsw-alias-bg-layer-1, #161b19);
+  color: var(--dsw-alias-label-primary, #e6e6e6);
+  font-family: var(--ds-font-family-code, monospace);
+  font-size: calc(12px * var(--mrf-scale, 1));
+  line-height: 1.55; tab-size: 2; white-space: pre; overflow: auto;
+}
+.mrf-editor:focus { outline: 1px solid var(--dsw-alias-border-l2); outline-offset: -1px; }
+.mrf-editButton { margin-left: 0; }
 /* Image preview: a neutral stage fills the pane and centres the picture both
    horizontally and vertically (the reference "middle" layout). The picture
    scales about that centre; when zoomed past the pane the stage scrolls so no

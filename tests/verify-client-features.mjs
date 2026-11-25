@@ -123,5 +123,26 @@ check('parentDir helper present', /function parentDir\(path\)/.test(clientSrc));
 check('open-folder uses host /open route', /function openInFileManager/.test(clientSrc) && /API_BASE\}\/open/.test(clientSrc));
 check('i18n lightbox strings in both locales', /imageOpen:/.test(clientSrc) && /imageDragHint:/.test(clientSrc) && /imageClose:/.test(clientSrc));
 
+console.log('\n=== editor: edit in place and save through /fs.write ===');
+check('client posts to /fs.write', /fetch\(routeUrl\(ctx, `\$\{API_BASE\}\/fs\.write`\)/.test(clientSrc));
+check('saveFile sends the loaded mtime (conflict guard)', /body\.mtimeMs = mtimeMs/.test(clientSrc));
+check('saveFile flags the conflict case', /conflict = \/changed on disk\/i\.test\(message\)/.test(clientSrc));
+check('edit button only for editable text', /const canEdit = isText && value\?\.editable !== false/.test(clientSrc));
+check('editor is a real textarea', /h\('textarea', \{[\s\S]{0,240}?className: 'mrf-editor'/.test(clientSrc));
+check('editor keeps its own draft state', /const \[draft, setDraft\] = useState\(''\)/.test(clientSrc));
+check('unsaved changes are tracked against the baseline', /const dirty = editing && draft !== baseline/.test(clientSrc));
+check('Ctrl+S saves', /event\.key\.toLowerCase\(\) === 's'/.test(clientSrc) && /commitEdit/.test(clientSrc));
+check('Esc leaves the editor', /event\.key === 'Escape'\) \{[\s\S]{0,80}?cancelEdit\(\)/.test(clientSrc));
+check('editor resets when the file changes', /setEditing\(false\);[\s\S]{0,200}?\}, \[preview\.path\]\)/.test(clientSrc));
+check('save refreshes the diff decoration', /void refreshDecoration\(\)/.test(clientSrc));
+check('save re-reads the diff of the open file', /const diff = await fetchDiff\(ctxRef\.current, path\)/.test(clientSrc));
+check('toggle is hidden while editing', /const toggle = isMd && !editing/.test(clientSrc));
+check('a read-only encoding is labelled, not editable', /editorReadOnlyEncoding/.test(clientSrc));
+check('editor CSS fills the pane', /\.mrf-editor\s*\{[^}]*white-space:\s*pre/s.test(clientSrc));
+check('host registers /fs.write', /registerPost\(host, 'fs\.write', handleFsWrite\)/.test(indexSrc));
+check('host refuses a stale mtime', /changed on disk since you opened it/.test(indexSrc));
+check('host never rewrites other encodings', /WRITABLE_ENCODINGS/.test(indexSrc) && /would change its encoding/.test(indexSrc));
+check('host keeps the file line ending', /applyLineEnding\(content, detectLineEnding/.test(indexSrc));
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED\n' : `\n${failures} CHECK(S) FAILED\n`);
 process.exit(failures === 0 ? 0 : 1);
